@@ -4,10 +4,13 @@ from astrbot.api.provider import LLMResponse
 from astrbot.api import logger
 import re
 
-@register("astrbot_plugin_markdown_killer", "AlanBacker", "移除LLM输出中的Markdown格式", "0.0.4", "https://github.com/AlanBacker/astrbot_plugin_markdown_killer")
+@register("astrbot_plugin_markdown_killer", "xkeyC", "移除LLM输出中的Markdown格式", "0.1.0", "https://github.com/xkeyC/astrbot_plugin_markdown_killer")
 class MarkdownKillerPlugin(Star):
-    def __init__(self, context: Context):
+    def __init__(self, context: Context, config: dict = None):
         super().__init__(context)
+        self.config = config or {}
+        self.remove_extra_newlines = self.config.get("remove_extra_newlines", True)
+        self.newline_mode = self.config.get("newline_mode", "segment_boundary")
     
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse, *args):
@@ -33,6 +36,52 @@ class MarkdownKillerPlugin(Star):
             log_msg = f"\n[Markdown Killer] --------------------------------------------------\n[Markdown Killer] 检测到Markdown并移除:\n[Markdown Killer] 原文: {original_preview}...\n[Markdown Killer] 处理: {cleaned_preview}...\n[Markdown Killer] --------------------------------------------------"
             logger.warning(log_msg)
 
+    def _remove_extra_newlines_segment_boundary(self, text: str) -> str:
+        """
+        Remove newlines after segment boundaries (punctuation marks).
+        
+        AstrBot segments messages at punctuation marks (。？！~…).
+        Newlines immediately after punctuation become the START of the next
+        segment, appearing as leading blank lines when sent.
+        
+        Example:
+            Original: "第一句。\n\n第二句。"
+            After split: ["第一句。", "\n\n第二句。"]
+            Result: Extra blank lines before "第二句。"
+        
+        Solution: Remove newlines right after segment punctuation.
+        """
+        text = re.sub(r'([。？！~…])\n+', r'\1', text)
+        return text.strip()
+    
+    def _remove_extra_newlines_global(self, text: str) -> str:
+        """
+        Compress consecutive newlines globally.
+        
+        Keeps at most one blank line between content for paragraph structure.
+        More aggressive but preserves intentional paragraph breaks.
+        """
+        lines = text.split('\n')
+        result_lines = []
+        prev_was_empty = False
+        
+        for line in lines:
+            stripped = line.rstrip()
+            is_empty = not stripped
+            
+            if is_empty:
+                if not prev_was_empty and result_lines:
+                    result_lines.append('')
+                prev_was_empty = True
+            else:
+                result_lines.append(stripped)
+                prev_was_empty = False
+        
+        while result_lines and not result_lines[-1]:
+            result_lines.pop()
+        
+        return '\n'.join(result_lines)
+    
     def remove_markdown(self, text: str) -> str:
         """
         移除文本中的Markdown格式
@@ -66,5 +115,12 @@ class MarkdownKillerPlugin(Star):
         
         # 移除列表标记 (移除行首的 - 或 *)
         text = re.sub(r"^\s*[-*]\s+(.*)", r"\1", text, flags=re.MULTILINE)
+        
+        # Remove extra newlines if enabled
+        if self.remove_extra_newlines:
+            if self.newline_mode == "global":
+                text = self._remove_extra_newlines_global(text)
+            else:
+                text = self._remove_extra_newlines_segment_boundary(text)
         
         return text

@@ -1,6 +1,6 @@
 name: astrbot_plugin_markdown_killer
-version: 0.0.4
-author: AlanBacker
+version: 0.1.0
+author: xkeyC
 desc: 移除LLM输出中的Markdown格式
-repo: https://github.com/AlanBacker/astrbot_plugin_markdown_killer
+repo: https://github.com/xkeyC/astrbot_plugin_markdown_killer.git
 display_name: Markdown杀手

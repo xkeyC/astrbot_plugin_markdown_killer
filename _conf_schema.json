@@ -1,0 +1,15 @@
+{
+    "remove_extra_newlines": {
+        "description": "移除多余的换行符",
+        "type": "bool",
+        "default": true,
+        "hint": "启用后，将移除文本中多余的换行，避免分段发送时出现过多空行"
+    },
+    "newline_mode": {
+        "description": "换行处理模式",
+        "type": "string",
+        "default": "segment_boundary",
+        "hint": "segment_boundary: 只移除分段标点后的换行（推荐）；global: 全局压缩连续空行",
+        "options": ["segment_boundary", "global"]
+    }
+}
