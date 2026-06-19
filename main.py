@@ -36,8 +36,8 @@ import time
 @register(
     "astrbot_plugin_markdown_killer",
     "xkeyC",
-    "移除输出中的Markdown格式（修正列表换行、新增表格图片渲染）",
-    "0.2.0",
+    "移除输出中的Markdown格式（修正列表换行、新增表格图片渲染、列表字数自适应）",
+    "0.2.1",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):
@@ -46,6 +46,9 @@ class MarkdownKillerPlugin(Star):
         self.config = config or {}
         self.remove_extra_newlines = self._config_get("remove_extra_newlines", True)
         self.newline_mode = self._config_get("newline_mode", "segment_boundary")
+        self.list_merge_char_threshold = self._coerce_int(
+            self._config_get("list_merge_char_threshold", 30), default=30
+        )
         self.enable_table_render = self._config_get("enable_table_render", True)
         self.table_render_fallback = self._config_get("table_render_fallback", "text")
 
@@ -109,6 +112,13 @@ class MarkdownKillerPlugin(Star):
         if hasattr(self.config, "get"):
             return self.config.get(key, default)
         return default
+
+    def _coerce_int(self, value, default: int) -> int:
+        """将配置值 (WebUI 可能传入字符串) 强制转为 int；失败则回退 default。"""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return default
 
     @filter.on_llm_response()
     async def on_llm_resp(self, event: AstrMessageEvent, resp: LLMResponse, *args):
@@ -329,11 +339,13 @@ class MarkdownKillerPlugin(Star):
         return [(seg["text"], seg["type"] == "table") for seg in segments]
 
     def _remove_list_markers(self, text: str) -> str:
-        """
-        合并连续列表项到同一行，避免被分段发送时拆分为多条消息。
+        """合并连续列表项到同一行，避免被分段发送时拆分为多条消息。
 
         实际逻辑已迁移至 ``utils/list_processor.py`` (纯标准库、可在测试中独立
         导入)，此处仅作薄包装以保留插件实例上的公共方法名 (向后兼容)。
+
+        自适应阈值来自配置项 ``list_merge_char_threshold`` (默认 30)：短列表
+        (总字数 ≤ 阈值) 合并到同一行；长列表保留多行布局仅去标记。
 
         行为详见 ``utils.list_processor.remove_list_markers`` 的 docstring：
         - 无序列表 [-*+]: 项与项之间用 `"; "` 连接，如 `a; b; c`。
@@ -342,9 +354,12 @@ class MarkdownKillerPlugin(Star):
         - 空行会中断列表 run，生成多个合并行。
         - 缩进的连续行作为上一项内容的延续；若该行本身也是列表标记 (缩进大于
           父项)，则剥离标记前缀只保留内容，避免内层 `-` 残留为字面字符 (N7)。
+        - 当总字数超过 ``list_merge_char_threshold`` 时，每项独占一行仅去标记。
         - 函数幂等：再次输入输出文本不会进一步改变。
         """
-        return _remove_list_markers_impl(text)
+        return _remove_list_markers_impl(
+            text, merge_threshold=self.list_merge_char_threshold
+        )
 
     def remove_markdown(self, text: str) -> str:
         """

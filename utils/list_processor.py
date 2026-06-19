@@ -16,8 +16,8 @@ _UNORD_LIST_RE = re.compile(r"^(\s*)[-*+]\s+(.+?)\s*$")
 _ORD_LIST_RE = re.compile(r"^(\s*)(\d+)[.)]\s+(.+?)\s*$")
 
 
-def remove_list_markers(text: str) -> str:
-    """合并连续列表项到同一行，避免被分段发送时拆分为多条消息。
+def remove_list_markers(text: str, merge_threshold: int = 30) -> str:
+    """移除列表标记，并按 ``merge_threshold`` 自适应决定输出布局。
 
     - 无序列表 [-*+]: 项与项之间用 ``"; "`` 连接，如 ``a; b; c``。
     - 有序列表 [N. / N)]: 标记替换为 ``N)`` (无空格)，项之间用空格连接，
@@ -28,7 +28,26 @@ def remove_list_markers(text: str) -> str:
         (N7 fix: 避免内层 ``-`` 残留为字面字符)。例如 ``- main\\n  - sub`` →
         ``main sub``。
       - 否则按原样追加 (例如 ``- main\\n  more details`` → ``main more details``)。
-    - 函数幂等：再次输入输出文本不会进一步改变。
+
+    Adaptive merge (adaptive-list-merge feature):
+      ``merge_threshold`` 控制一段列表 (同一 run 内所有项) 是否合并到同一行。
+      计算公式：``total_chars = sum(len(content) for _, content in items)``，
+      按 Unicode 码点计数 (中文字符与英文字符均记 1)，不对内容做 trim/预处理。
+
+      - ``merge_threshold <= 0``: 无条件合并到一行 (旧行为，用作 escape hatch)。
+      - ``total_chars <= merge_threshold``: 合并到同一行 (短列表，避免分段发送
+        时被拆分)。
+      - ``total_chars > merge_threshold``: 保留每项独立一行，仅去除列表标记。
+        无序: 每项内容独占一行 (无前缀)。
+        有序: 每项内容独占一行 (丢弃数字前缀，行顺序天然保序)。
+
+    函数幂等：再次输入输出文本不会进一步改变。长列表输出已无标记，第二趟会
+    当作普通行原样返回 (已验证)。
+
+    Args:
+        text: 待处理文本。
+        merge_threshold: 字符数阈值。默认 30，覆盖典型短列表。设为 0 强制合并
+            (旧行为)。负数也视为无条件合并。
     """
     lines = text.split("\n")
     output_lines: List[str] = []
@@ -90,11 +109,23 @@ def remove_list_markers(text: str) -> str:
                 continue
             break
 
-        if is_ordered:
-            joined = " ".join(f"{num}){content}" for num, content in items)
+        total_chars = sum(len(content) for _, content in items)
+        if merge_threshold <= 0 or total_chars <= merge_threshold:
+            # Merge all items to a single line (preserves original behavior for
+            # short lists; merge_threshold<=0 forces merge unconditionally as
+            # an escape hatch).
+            if is_ordered:
+                joined = " ".join(f"{num}){content}" for num, content in items)
+            else:
+                joined = "; ".join(content for _, content in items)
+            output_lines.append(joined)
         else:
-            joined = "; ".join(content for _, content in items)
-        output_lines.append(joined)
+            # Long list: preserve multi-line layout, strip ONLY the marker.
+            # For ordered lists, drop the number prefix entirely (line order
+            # already encodes sequence — matches the markdown-killer intent of
+            # removing markdown formatting).
+            for _num, content in items:
+                output_lines.append(content)
 
     return "\n".join(output_lines)
 
