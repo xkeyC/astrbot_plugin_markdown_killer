@@ -1,6 +1,6 @@
 name: astrbot_plugin_markdown_killer
-version: 0.1.1
+version: 0.2.0
 author: xkeyC
-desc: 移除输出中的Markdown格式（保留换行处理与全局控制开关）
+desc: 移除输出中的Markdown格式（修正列表换行、新增表格图片渲染）
 repo: https://github.com/xkeyC/astrbot_plugin_markdown_killer.git
 display_name: Markdown杀手
