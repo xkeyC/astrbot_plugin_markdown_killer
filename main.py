@@ -37,7 +37,7 @@ import time
     "astrbot_plugin_markdown_killer",
     "xkeyC",
     "移除输出中的Markdown格式（修正列表换行、新增表格图片渲染、列表字数自适应）",
-    "0.2.1",
+    "0.2.2",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):
@@ -362,23 +362,32 @@ class MarkdownKillerPlugin(Star):
         )
 
     def remove_markdown(self, text: str) -> str:
-        """
-        移除文本中的 Markdown 格式。
+        """移除文本中的 Markdown 格式。
 
-        Markdown 表格语法会被保留（仅做行尾空白清理），交由 on_decorating_result
-        阶段渲染为图片。
+        Markdown 表格语法会被保留并交由 on_decorating_result 阶段渲染为图片。
+        为保证后续 ``detect_markdown_tables`` 能正确识别（要求表格 header 行
+        必须位于行首），文本块与表格块之间必须以换行分隔。
+
+        旧的 ``"".join(out_parts)`` 实现会把表格块直接拼到上一个文本块尾部
+        （文本块的尾部换行已被 ``_remove_markdown_no_tables`` 清理），导致
+        ``| 功能 |`` 紧贴前文，表格不再被检测到（静默失败）。此处改为智能
+        拼接：保证每个表格块均以行首开始、以换行结束。
         """
         blocks = self._split_table_blocks(text)
-        out_parts: list[str] = []
+        result = ""
         for block, is_table in blocks:
             if is_table:
-                # Preserve table syntax; only strip trailing whitespace per line.
-                out_parts.append(
-                    "\n".join(ln.rstrip() for ln in block.split("\n"))
-                )
-                continue
-            out_parts.append(self._remove_markdown_no_tables(block))
-        return "".join(out_parts)
+                cleaned = "\n".join(ln.rstrip() for ln in block.split("\n"))
+                # Guarantee the table starts on its own line.
+                if result and not result.endswith("\n"):
+                    result += "\n"
+                result += cleaned
+                # Guarantee a trailing newline so the next text doesn't glue on.
+                if not cleaned.endswith("\n"):
+                    result += "\n"
+            else:
+                result += self._remove_markdown_no_tables(block)
+        return result
 
     def _remove_markdown_no_tables(self, text: str) -> str:
         """Apply markdown-removal regexes to a table-free block of text."""
