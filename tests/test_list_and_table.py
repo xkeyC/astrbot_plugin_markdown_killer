@@ -94,6 +94,108 @@ def test_list_removal_idempotent():
         print(f"OK  idempotency:  {inp!r} -> {once!r} (stable)")
 
 
+def test_list_removal_adaptive_merge():
+    """Adaptive merge: short lists merge to one line, long lists keep multi-line."""
+    # --- Short lists (default threshold 30): merge to one line (unchanged) ---
+    short_cases = [
+        ("- a\n- b\n- c", "a; b; c"),
+        ("1. First\n2. Second\n3. Third", "1)First 2)Second 3)Third"),
+    ]
+    for inp, expected in short_cases:
+        actual = remove_list_markers(inp)  # default threshold 30
+        assert actual == expected, (
+            f"FAIL short-list merge: {inp!r} -> {actual!r} (expected {expected!r})"
+        )
+        print(f"OK  short-merge:  {inp!r} -> {actual!r}")
+
+    # --- Long unordered list (total_chars=46 > 30): preserve multi-line ---
+    long_unord_in = (
+        "- 第一项这是一段比较长的说明文字\n"
+        "- 第二项也是一段比较长的说明文字\n"
+        "- 第三项依旧是一段比较长的说明文字"
+    )
+    long_unord_expected = (
+        "第一项这是一段比较长的说明文字\n"
+        "第二项也是一段比较长的说明文字\n"
+        "第三项依旧是一段比较长的说明文字"
+    )
+    actual = remove_list_markers(long_unord_in)
+    assert actual == long_unord_expected, (
+        f"FAIL long-unord preserve: {actual!r} (expected {long_unord_expected!r})"
+    )
+    print(f"OK  long-unord:   3 items, multi-line preserved, markers stripped")
+
+    # --- Long ordered list (the user's example; total_chars=140 > 30) ---
+    long_ord_in = (
+        "1. 第一步：准备工作，确保已安装 Python 3.10 或以上版本。\n"
+        "2. 第二步：克隆仓库到本地，使用 git clone 命令。\n"
+        "3. 第三步：进入项目目录，运行 pip install -r requirements.txt。\n"
+        "4. 第四步：启动 AstrBot，使用 uv run main.py。"
+    )
+    long_ord_expected = (
+        "第一步：准备工作，确保已安装 Python 3.10 或以上版本。\n"
+        "第二步：克隆仓库到本地，使用 git clone 命令。\n"
+        "第三步：进入项目目录，运行 pip install -r requirements.txt。\n"
+        "第四步：启动 AstrBot，使用 uv run main.py。"
+    )
+    actual = remove_list_markers(long_ord_in)
+    assert actual == long_ord_expected, (
+        f"FAIL long-ord preserve: {actual!r} (expected {long_ord_expected!r})"
+    )
+    print(f"OK  long-ord:     4 items (user example), multi-line preserved, "
+          f"number prefixes dropped")
+
+    # Verify: no remaining list markers in the long-ordered output.
+    for ln in actual.split("\n"):
+        assert not ln.startswith(("1.", "1)", "-", "*", "+")), (
+            f"FAIL long-ord: line still has marker: {ln!r}"
+        )
+
+    # --- Threshold escape hatch: merge_threshold=0 forces unconditional merge ---
+    esc1_in = (
+        "- 第一项这是一段比较长的说明文字\n"
+        "- 第二项也是一段比较长的说明文字"
+    )
+    esc1_expected = (
+        "第一项这是一段比较长的说明文字; 第二项也是一段比较长的说明文字"
+    )
+    actual = remove_list_markers(esc1_in, merge_threshold=0)
+    assert actual == esc1_expected, (
+        f"FAIL escape-hatch 0: {actual!r} (expected {esc1_expected!r})"
+    )
+    print(f"OK  escape-0:     threshold=0 forces merge -> {actual!r}")
+
+    # merge_threshold=100 keeps short list merging as normal (under threshold).
+    esc2_actual = remove_list_markers("- a\n- b", merge_threshold=100)
+    assert esc2_actual == "a; b", (
+        f"FAIL escape-100: {esc2_actual!r} (expected 'a; b')"
+    )
+    print(f"OK  escape-100:   threshold=100, short list merged -> {esc2_actual!r}")
+
+    # --- Explicit threshold, unambiguous direction ---
+    # total_chars=3 <= 5 -> merge.
+    t1_actual = remove_list_markers("- a\n- b\n- c", merge_threshold=5)
+    assert t1_actual == "a; b; c", (
+        f"FAIL explicit-thr-5: {t1_actual!r} (expected 'a; b; c')"
+    )
+    print(f"OK  explicit-5:   {t1_actual!r}")
+
+    # total_chars=6 > 4 -> preserve multi-line.
+    t2_actual = remove_list_markers("- abc\n- def", merge_threshold=4)
+    assert t2_actual == "abc\ndef", (
+        f"FAIL explicit-thr-4: {t2_actual!r} (expected 'abc\\ndef')"
+    )
+    print(f"OK  explicit-4:   {t2_actual!r}")
+
+    # --- Idempotency on long-list output ---
+    long_out = remove_list_markers(long_ord_in)
+    long_out_twice = remove_list_markers(long_out)
+    assert long_out == long_out_twice, (
+        f"FAIL long-list idempotency: once={long_out!r} twice={long_out_twice!r}"
+    )
+    print(f"OK  long-idem:    long-list output stable under re-application")
+
+
 # ---------------------------------------------------------------------------
 # Tests — table detection / parsing / splitting / HTML (real imports).
 # ---------------------------------------------------------------------------
@@ -161,6 +263,7 @@ def main():
     print("=" * 70)
     test_list_removal_basic()
     test_list_removal_idempotent()
+    test_list_removal_adaptive_merge()
     test_table_detection()
     test_table_parse()
     test_split_text_around_tables()

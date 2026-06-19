@@ -21,6 +21,12 @@
             "global"
         ]
     },
+    "list_merge_char_threshold": {
+        "description": "列表项合并字数阈值",
+        "type": "int",
+        "default": 30,
+        "hint": "当一段列表（无序或有序）所有项总字符数 <= 此阈值时，会合并到同一行避免分段发送被拆分；超过阈值则保留多行布局（仅去除列表标记）。设为 0 表示无条件合并到一行（旧行为）。"
+    },
     "enable_table_render": {
         "description": "启用表格图片渲染",
         "type": "bool",
