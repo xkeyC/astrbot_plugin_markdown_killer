@@ -3,7 +3,7 @@
         "description": "全局 Markdown 移除",
         "type": "bool",
         "default": false,
-        "hint": "开启后，将从所有即将发送的最终文本消息中移除 Markdown 格式（而不仅限于 LLM 直接输出的内容）。"
+        "hint": "开启后，将从所有即将发送的最终文本消息中移除 Markdown 格式（而不仅限于 LLM 直接输出的内容）。若同时关闭此项与表格图片渲染，表格将以原始 Markdown 语法保留在文本中（不被清理）。"
     },
     "remove_extra_newlines": {
         "description": "移除多余的换行符",
@@ -25,7 +25,7 @@
         "description": "启用表格图片渲染",
         "type": "bool",
         "default": true,
-        "hint": "开启后，LLM 回复中的 Markdown 表格将使用 Playwright 浏览器渲染为图片并嵌入文本消息中。需要执行 `python -m playwright install chromium` 安装浏览器（首次启用时插件会尝试自动安装）。"
+        "hint": "开启后，LLM 回复中的 Markdown 表格将使用 Playwright 浏览器渲染为图片并嵌入文本消息中。需要执行 `python -m playwright install chromium` 安装浏览器（首次启用时插件会尝试自动安装）。若同时关闭此项且启用全局 Markdown 移除，表格将以原始 Markdown 语法保留在文本中（不被清理）。"
     },
     "table_render_fallback": {
         "description": "表格渲染失败回退策略",

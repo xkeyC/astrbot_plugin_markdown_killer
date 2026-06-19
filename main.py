@@ -14,6 +14,7 @@ try:
         render_table_to_image_bytes,
         split_text_around_tables,
     )
+    from .utils.list_processor import remove_list_markers as _remove_list_markers_impl
 except ImportError:  # pragma: no cover - fallback when loaded as top-level module
     from utils import (  # type: ignore
         EnvManager,
@@ -23,8 +24,13 @@ except ImportError:  # pragma: no cover - fallback when loaded as top-level modu
         render_table_to_image_bytes,
         split_text_around_tables,
     )
+    from utils.list_processor import (  # type: ignore
+        remove_list_markers as _remove_list_markers_impl,
+    )
 
+import asyncio
 import re
+import time
 
 
 @register(
@@ -42,6 +48,11 @@ class MarkdownKillerPlugin(Star):
         self.newline_mode = self._config_get("newline_mode", "segment_boundary")
         self.enable_table_render = self._config_get("enable_table_render", True)
         self.table_render_fallback = self._config_get("table_render_fallback", "text")
+
+        # N4: suppress repeated warnings for table-render failures — log the
+        # first occurrence at warning level and downgrade subsequent ones to
+        # debug, since the same root cause typically affects every render.
+        self._table_render_failure_logged: bool = False
 
         # Detect Playwright availability up-front; re-checked in initialize().
         self._playwright_available = False
@@ -145,9 +156,20 @@ class MarkdownKillerPlugin(Star):
                     self._log_cleaned_text(text, cleaned_text, source="[全局过滤]")
 
     async def _render_tables_in_chain(self, result) -> None:
-        """Scan the chain for Plain components containing markdown tables; render as images."""
-        new_chain = []
-        for comp in result.chain:
+        """Scan the chain for Plain components containing markdown tables; render as images.
+
+        Tables within the SAME message are rendered concurrently via
+        ``asyncio.gather`` (N3) to minimize total wall-clock latency. A single
+        summary log line is emitted at info level; per-table success/fallback
+        logs are downgraded to debug (N4). The fallback policy
+        (``table_render_fallback``: text/raw/remove) is unchanged.
+        """
+        start_ts = time.perf_counter()
+
+        # Collect render jobs: (comp_index, seg_index_within_comp, table_text).
+        # Two Plain comps in the same chain each with a table → two parallel jobs.
+        jobs: list[tuple[int, int, str]] = []
+        for comp_index, comp in enumerate(result.chain):
             text = getattr(comp, "text", None)
             if (
                 isinstance(comp, Comp.Plain)
@@ -155,28 +177,67 @@ class MarkdownKillerPlugin(Star):
                 and detect_markdown_tables(text)
             ):
                 segments = split_text_around_tables(text)
-                for seg in segments:
-                    if seg["type"] == "text":
-                        if seg["text"].strip():
-                            new_chain.append(Comp.Plain(seg["text"]))
-                    elif seg["type"] == "table":
-                        image_bytes = await render_table_to_image_bytes(
-                            seg["text"], timeout=20000
-                        )
-                        if image_bytes:
-                            new_chain.append(Comp.Image.fromBytes(image_bytes))
-                            logger.info("[MarkdownKiller] 表格已渲染为图片")
-                        else:
-                            fallback = self._apply_table_fallback(seg["text"])
-                            if fallback is not None:
-                                new_chain.append(Comp.Plain(fallback))
-                            logger.warning(
-                                f"[MarkdownKiller] 表格渲染失败，已按 "
-                                f"{self.table_render_fallback} 策略回退"
-                            )
+                for seg_index, seg in enumerate(segments):
+                    if seg["type"] == "table":
+                        jobs.append((comp_index, seg_index, seg["text"]))
+
+        if not jobs:
+            return
+
+        # Render all tables in parallel; exceptions become None (fallback path).
+        render_tasks = [
+            render_table_to_image_bytes(job_text, timeout=20000)
+            for _, _, job_text in jobs
+        ]
+        gathered = await asyncio.gather(*render_tasks, return_exceptions=True)
+        results: dict[tuple[int, int], bytes | None] = {}
+        for (comp_index, seg_index, _), outcome in zip(jobs, gathered):
+            if isinstance(outcome, Exception):
+                results[(comp_index, seg_index)] = None
             else:
+                results[(comp_index, seg_index)] = outcome
+
+        # Reconstruct the chain using rendered images / fallbacks (order preserved).
+        new_chain = []
+        for comp_index, comp in enumerate(result.chain):
+            text = getattr(comp, "text", None)
+            if not (
+                isinstance(comp, Comp.Plain)
+                and isinstance(text, str)
+                and detect_markdown_tables(text)
+            ):
                 new_chain.append(comp)
+                continue
+
+            segments = split_text_around_tables(text)
+            for seg_index, seg in enumerate(segments):
+                if seg["type"] == "text":
+                    if seg["text"].strip():
+                        new_chain.append(Comp.Plain(seg["text"]))
+                elif seg["type"] == "table":
+                    image_bytes = results.get((comp_index, seg_index))
+                    if image_bytes:
+                        new_chain.append(Comp.Image.fromBytes(image_bytes))
+                        logger.debug("[MarkdownKiller] 表格已渲染为图片")
+                    else:
+                        fallback = self._apply_table_fallback(seg["text"])
+                        if fallback is not None:
+                            new_chain.append(Comp.Plain(fallback))
+                        fallback_msg = (
+                            f"[MarkdownKiller] 表格渲染失败，已按 "
+                            f"{self.table_render_fallback} 策略回退"
+                        )
+                        if not self._table_render_failure_logged:
+                            logger.warning(fallback_msg)
+                            self._table_render_failure_logged = True
+                        else:
+                            logger.debug(fallback_msg)
         result.chain = new_chain
+
+        elapsed = time.perf_counter() - start_ts
+        logger.info(
+            f"[MarkdownKiller] 渲染 {len(jobs)} 个表格，耗时 {elapsed:.2f}s"
+        )
 
     def _apply_table_fallback(self, table_md: str) -> str | None:
         """Return fallback text for a table block according to table_render_fallback config."""
@@ -271,74 +332,19 @@ class MarkdownKillerPlugin(Star):
         """
         合并连续列表项到同一行，避免被分段发送时拆分为多条消息。
 
+        实际逻辑已迁移至 ``utils/list_processor.py`` (纯标准库、可在测试中独立
+        导入)，此处仅作薄包装以保留插件实例上的公共方法名 (向后兼容)。
+
+        行为详见 ``utils.list_processor.remove_list_markers`` 的 docstring：
         - 无序列表 [-*+]: 项与项之间用 `"; "` 连接，如 `a; b; c`。
         - 有序列表 [N. / N)]: 标记替换为 `N)`（无空格），项之间用空格连接，
           如 `1)First 2)Second 3)Third`。
         - 空行会中断列表 run，生成多个合并行。
-        - 缩进的连续行作为上一项内容的延续（用空格连接）。
+        - 缩进的连续行作为上一项内容的延续；若该行本身也是列表标记 (缩进大于
+          父项)，则剥离标记前缀只保留内容，避免内层 `-` 残留为字面字符 (N7)。
         - 函数幂等：再次输入输出文本不会进一步改变。
         """
-        lines = text.split("\n")
-        output_lines: list[str] = []
-        i = 0
-        n = len(lines)
-
-        unord_re = re.compile(r"^(\s*)[-*+]\s+(.+?)\s*$")
-        ord_re = re.compile(r"^(\s*)(\d+)[.)]\s+(.+?)\s*$")
-
-        while i < n:
-            line = lines[i]
-            m_unord = unord_re.match(line)
-            m_ord = ord_re.match(line)
-
-            if m_ord:
-                is_ordered = True
-                indent = m_ord.group(1)
-                items: list[tuple[str | None, str]] = [
-                    (m_ord.group(2), m_ord.group(3))
-                ]
-                i += 1
-            elif m_unord:
-                is_ordered = False
-                indent = m_unord.group(1)
-                items = [(None, m_unord.group(2))]
-                i += 1
-            else:
-                output_lines.append(line)
-                i += 1
-                continue
-
-            while i < n:
-                cur = lines[i]
-                m_unord_cur = unord_re.match(cur)
-                m_ord_cur = ord_re.match(cur)
-
-                if is_ordered and m_ord_cur and m_ord_cur.group(1) == indent:
-                    items.append((m_ord_cur.group(2), m_ord_cur.group(3)))
-                    i += 1
-                    continue
-                if (not is_ordered) and m_unord_cur and m_unord_cur.group(1) == indent:
-                    items.append((None, m_unord_cur.group(2)))
-                    i += 1
-                    continue
-
-                # Indented continuation: append to last item's content.
-                indent_match = re.match(r"^(\s*)(\S.*)?$", cur)
-                cur_indent = indent_match.group(1) if indent_match else ""
-                if cur.strip() and len(cur_indent) > len(indent):
-                    last_num, last_content = items[-1]
-                    items[-1] = (last_num, f"{last_content} {cur.strip()}")
-                    i += 1
-                    continue
-                break
-
-            if is_ordered:
-                joined = " ".join(f"{num}){content}" for num, content in items)
-            else:
-                joined = "; ".join(content for _, content in items)
-            output_lines.append(joined)
-
-        return "\n".join(output_lines)
+        return _remove_list_markers_impl(text)
 
     def remove_markdown(self, text: str) -> str:
         """

@@ -40,7 +40,12 @@ class EnvManager:
             return False
 
     async def install_dependencies(self) -> None:
-        """Run ``python -m playwright install chromium`` and write the flag file on success."""
+        """Run ``python -m playwright install chromium`` and write the flag file on success.
+
+        A 5-minute (300s) timeout guards against stalled network installs (N5):
+        on timeout we kill the subprocess and return without writing the flag
+        file, so the next run will retry.
+        """
         logger.info("正在初始化插件依赖 (Playwright)...")
         try:
             logger.info("正在安装 Playwright Chromium...")
@@ -58,7 +63,23 @@ class EnvManager:
                 if msg:
                     logger.info(f"[Playwright] {msg}")
 
-            await process.wait()
+            try:
+                await asyncio.wait_for(process.wait(), timeout=300)
+            except asyncio.TimeoutError:
+                logger.error(
+                    "Playwright Chromium 安装超时 (300s)，请检查网络或手动安装"
+                )
+                try:
+                    process.kill()
+                except ProcessLookupError:
+                    pass
+                except Exception:
+                    pass
+                try:
+                    await process.wait()
+                except Exception:
+                    pass
+                return
 
             if process.returncode == 0:
                 if await self.verify_playwright():

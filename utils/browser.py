@@ -7,20 +7,32 @@ load and fall back to plain-text table output.
 
 from __future__ import annotations
 
+import asyncio
+
 from astrbot.api import logger
 
 # Singleton instances; lazily initialized by ``get_browser``.
 _playwright_instance = None
 _browser_instance = None
 
+# Lock guarding singleton initialization to prevent the race where two
+# concurrent coroutines both see ``_browser_instance is None`` and each try to
+# launch its own browser (N2).
+_browser_lock = asyncio.Lock()
+
 
 async def get_browser():
     """Return a connected singleton browser, creating one if necessary.
 
     Returns ``None`` if Playwright is unavailable or browser launch fails.
+
+    Initialization is guarded by ``_browser_lock`` to avoid duplicate launches
+    under concurrent first-time callers. The fast path (already-connected
+    browser) skips the lock entirely.
     """
     global _playwright_instance, _browser_instance
 
+    # Fast path: a connected browser is already cached.
     if _browser_instance and _playwright_instance:
         try:
             if _browser_instance.is_connected():
@@ -28,29 +40,39 @@ async def get_browser():
         except Exception:
             pass
 
-    try:
-        from playwright.async_api import async_playwright
+    async with _browser_lock:
+        # Re-check under lock — another coroutine may have just initialized it
+        # while we were waiting to acquire the lock.
+        if _browser_instance and _playwright_instance:
+            try:
+                if _browser_instance.is_connected():
+                    return _browser_instance
+            except Exception:
+                pass
 
-        _playwright_instance = await async_playwright().start()
+        try:
+            from playwright.async_api import async_playwright
 
-        chrome_args = [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-gpu",
-            "--no-first-run",
-            "--disable-extensions",
-            "--disable-default-apps",
-        ]
+            _playwright_instance = await async_playwright().start()
 
-        _browser_instance = await _playwright_instance.chromium.launch(
-            headless=True,
-            args=chrome_args,
-        )
-        return _browser_instance
-    except Exception as e:
-        logger.error(f"初始化浏览器失败: {e}")
-        return None
+            chrome_args = [
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--no-first-run",
+                "--disable-extensions",
+                "--disable-default-apps",
+            ]
+
+            _browser_instance = await _playwright_instance.chromium.launch(
+                headless=True,
+                args=chrome_args,
+            )
+            return _browser_instance
+        except Exception as e:
+            logger.error(f"初始化浏览器失败: {e}")
+            return None
 
 
 async def close_browser():
@@ -70,26 +92,6 @@ async def close_browser():
         except Exception:
             pass
         _playwright_instance = None
-
-
-async def create_page(width: int = 1400, scale_factor: int = 2):
-    """Create a fresh browser context + page. Caller is responsible for closing."""
-    browser = await get_browser()
-    if not browser:
-        return None
-
-    try:
-        from playwright.async_api import ViewportSize
-
-        context = await browser.new_context(
-            viewport=ViewportSize(width=width, height=10000),
-            device_scale_factor=scale_factor,
-        )
-        page = await context.new_page()
-        return page
-    except Exception as e:
-        logger.error(f"创建页面失败: {e}")
-        return None
 
 
 async def render_html_to_image(

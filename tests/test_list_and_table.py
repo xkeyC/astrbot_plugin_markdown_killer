@@ -1,134 +1,56 @@
 """Standalone tests for list-marker removal and markdown-table detection.
 
-This script MUST NOT import astrbot. It mirrors the logic from main.py and
-utils/table_renderer.py exactly so it can run anywhere with only the standard
-library.
+This script exercises the REAL implementation in ``utils/list_processor.py``
+and ``utils/table_renderer.py`` (no mirror logic). Because
+``utils.table_renderer`` does ``from astrbot.api import logger`` at module
+scope, we install lightweight ``sys.modules`` stubs BEFORE the import so the
+file is importable from any environment without an AstrBot runtime.
 
 Run: ``python tests/test_list_and_table.py``
 """
 
-import re
+import logging
+import os
+import sys
+import types
 
+# Repo root on sys.path so that ``import utils.*`` works no matter where the
+# script is invoked from.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
 
-# ----------------------------------------------------------------------------
-# Mirror of MarkdownKillerPlugin._remove_list_markers (from main.py).
-# Keep this in sync with the implementation in main.py.
-# ----------------------------------------------------------------------------
-def remove_list_markers_local(text):
-    lines = text.split("\n")
-    output_lines = []
-    i = 0
-    n = len(lines)
+# ---------------------------------------------------------------------------
+# Stub astrbot.api.logger so utils.table_renderer can be imported standalone.
+# (N8: option (a) — sys.modules stub. No real astrbot required.)
+# ---------------------------------------------------------------------------
+_astrbot_pkg = types.ModuleType("astrbot")
+_astrbot_api_pkg = types.ModuleType("astrbot.api")
+_logger_stub = types.ModuleType("astrbot.api.logger")
 
-    unord_re = re.compile(r"^(\s*)[-*+]\s+(.+?)\s*$")
-    ord_re = re.compile(r"^(\s*)(\d+)[.)]\s+(.+?)\s*$")
+_test_logger = logging.getLogger("test_markdown_killer")
+_test_logger.addHandler(logging.NullHandler())
+_logger_stub.get_logger = lambda *a, **k: _test_logger
+# Make `from astrbot.api import logger` return the stubbed logger object.
+_astrbot_api_pkg.logger = _test_logger
 
-    while i < n:
-        line = lines[i]
-        m_unord = unord_re.match(line)
-        m_ord = ord_re.match(line)
+sys.modules["astrbot"] = _astrbot_pkg
+sys.modules["astrbot.api"] = _astrbot_api_pkg
+sys.modules["astrbot.api.logger"] = _logger_stub
 
-        if m_ord:
-            is_ordered = True
-            indent = m_ord.group(1)
-            items = [(m_ord.group(2), m_ord.group(3))]
-            i += 1
-        elif m_unord:
-            is_ordered = False
-            indent = m_unord.group(1)
-            items = [(None, m_unord.group(2))]
-            i += 1
-        else:
-            output_lines.append(line)
-            i += 1
-            continue
-
-        while i < n:
-            cur = lines[i]
-            m_unord_cur = unord_re.match(cur)
-            m_ord_cur = ord_re.match(cur)
-
-            if is_ordered and m_ord_cur and m_ord_cur.group(1) == indent:
-                items.append((m_ord_cur.group(2), m_ord_cur.group(3)))
-                i += 1
-                continue
-            if (not is_ordered) and m_unord_cur and m_unord_cur.group(1) == indent:
-                items.append((None, m_unord_cur.group(2)))
-                i += 1
-                continue
-
-            indent_match = re.match(r"^(\s*)(\S.*)?$", cur)
-            cur_indent = indent_match.group(1) if indent_match else ""
-            if cur.strip() and len(cur_indent) > len(indent):
-                last_num, last_content = items[-1]
-                items[-1] = (last_num, f"{last_content} {cur.strip()}")
-                i += 1
-                continue
-            break
-
-        if is_ordered:
-            joined = " ".join(f"{num}){content}" for num, content in items)
-        else:
-            joined = "; ".join(content for _, content in items)
-        output_lines.append(joined)
-
-    return "\n".join(output_lines)
-
-
-# ----------------------------------------------------------------------------
-# Mirror of utils/table_renderer.py detection / parsing / splitting.
-# ----------------------------------------------------------------------------
-_TABLE_RE = re.compile(
-    r"^[ \t]*\|[^\n]+\|[ \t]*\n"
-    r"[ \t]*\|[ \t]*:?[-:]+[- :|]*\|[ \t]*\n"
-    r"(?:[ \t]*\|[^\n]+\|[ \t]*\n?)+$",
-    re.MULTILINE,
+# Now safe to import the real modules.
+from utils.list_processor import remove_list_markers  # noqa: E402
+from utils.table_renderer import (  # noqa: E402
+    build_table_html,
+    detect_markdown_tables,
+    parse_markdown_table,
+    split_text_around_tables,
 )
 
 
-def detect_markdown_tables_local(text):
-    return [(m.start(), m.end(), m.group(0)) for m in _TABLE_RE.finditer(text)]
-
-
-def parse_markdown_table_local(table_text):
-    lines = [ln for ln in table_text.split("\n") if ln.strip()]
-    if len(lines) < 3:
-        return ([], [])
-
-    def parse_row(line):
-        s = line.strip()
-        if s.startswith("|"):
-            s = s[1:]
-        if s.endswith("|"):
-            s = s[:-1]
-        cells = re.split(r"\s*\|\s*", s)
-        return [c.strip() for c in cells]
-
-    header = parse_row(lines[0])
-    body = [parse_row(ln) for ln in lines[2:]]
-    return (header, body)
-
-
-def split_text_around_tables_local(text):
-    matches = detect_markdown_tables_local(text)
-    if not matches:
-        return [{"type": "text", "text": text}]
-
-    segments = []
-    last_end = 0
-    for start, end, table_text in matches:
-        if start > last_end:
-            segments.append({"type": "text", "text": text[last_end:start]})
-        segments.append({"type": "table", "text": table_text})
-        last_end = end
-    if last_end < len(text):
-        segments.append({"type": "text", "text": text[last_end:]})
-    return segments
-
-
-# ----------------------------------------------------------------------------
-# Tests
-# ----------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Tests — list-marker removal (basic + idempotency).
+# ---------------------------------------------------------------------------
 def test_list_removal_basic():
     cases = [
         ("- a\n- b\n- c", "a; b; c"),
@@ -136,9 +58,15 @@ def test_list_removal_basic():
         ("1. First\n2. Second\n3. Third", "1)First 2)Second 3)Third"),
         ("1) First\n2) Second", "1)First 2)Second"),
         ("Before\n- a\n- b\nAfter", "Before\na; b\nAfter"),
+        # N7: nested sub-list markers stripped when consumed as continuation.
+        ("- main\n  - sub1\n  - sub2\n- next", "main sub1 sub2; next"),
+        # N7: non-marker continuation, unchanged behavior.
+        ("- main\n  more details", "main more details"),
+        # N7: ordered + indented non-marker continuation.
+        ("1. 第一步\n   子说明\n2. 第二步", "1)第一步 子说明 2)第二步"),
     ]
     for inp, expected in cases:
-        actual = remove_list_markers_local(inp)
+        actual = remove_list_markers(inp)
         assert actual == expected, (
             f"FAIL list-removal: {inp!r} -> {actual!r} (expected {expected!r})"
         )
@@ -152,18 +80,25 @@ def test_list_removal_idempotent():
         "1. First\n2. Second\n3. Third",
         "1) First\n2) Second",
         "Before\n- a\n- b\nAfter",
+        # N7 cases must also be stable under re-application.
+        "- main\n  - sub1\n  - sub2\n- next",
+        "- main\n  more details",
+        "1. 第一步\n   子说明\n2. 第二步",
     ]
     for inp in cases:
-        once = remove_list_markers_local(inp)
-        twice = remove_list_markers_local(once)
+        once = remove_list_markers(inp)
+        twice = remove_list_markers(once)
         assert once == twice, (
             f"FAIL idempotency: input={inp!r} once={once!r} twice={twice!r}"
         )
         print(f"OK  idempotency:  {inp!r} -> {once!r} (stable)")
 
 
+# ---------------------------------------------------------------------------
+# Tests — table detection / parsing / splitting / HTML (real imports).
+# ---------------------------------------------------------------------------
 def test_table_detection():
-    matches = detect_markdown_tables_local("| a | b |\n|---|---|\n| 1 | 2 |\n")
+    matches = detect_markdown_tables("| a | b |\n|---|---|\n| 1 | 2 |\n")
     assert len(matches) == 1, f"FAIL detect: expected 1 match, got {len(matches)}"
     start, end, txt = matches[0]
     assert txt == "| a | b |\n|---|---|\n| 1 | 2 |\n", (
@@ -172,27 +107,27 @@ def test_table_detection():
     print(f"OK  detect:       1 match, span=({start},{end})")
 
     # Chinese content + 2 body rows.
-    matches2 = detect_markdown_tables_local(
+    matches2 = detect_markdown_tables(
         "| 名称 | 数量 |\n| --- | --- |\n| 苹果 | 10   |\n| 橙子 | 20   |\n"
     )
     assert len(matches2) == 1, f"FAIL detect chinese: {len(matches2)} matches"
     print("OK  detect:       chinese table detected")
 
     # No table.
-    matches3 = detect_markdown_tables_local("just text\nno table here")
+    matches3 = detect_markdown_tables("just text\nno table here")
     assert len(matches3) == 0, f"FAIL detect no-table: {len(matches3)} matches"
     print("OK  detect:       no-table returns 0 matches")
 
 
 def test_table_parse():
-    header, body = parse_markdown_table_local("| a | b |\n|---|---|\n| 1 | 2 |\n")
+    header, body = parse_markdown_table("| a | b |\n|---|---|\n| 1 | 2 |\n")
     assert header == ["a", "b"], f"FAIL parse header: {header!r}"
     assert body == [["1", "2"]], f"FAIL parse body: {body!r}"
     print(f"OK  parse:        header={header!r} body={body!r}")
 
 
 def test_split_text_around_tables():
-    segments = split_text_around_tables_local(
+    segments = split_text_around_tables(
         "intro\n| a | b |\n|---|---|\n| 1 | 2 |\ntail"
     )
     assert len(segments) == 3, (
@@ -207,15 +142,29 @@ def test_split_text_around_tables():
     )
 
 
+def test_build_table_html_smoke():
+    """build_table_html should escape cells and emit a complete <table>."""
+    html = build_table_html(["a", "b"], [["1", "2"]])
+    assert "<table>" in html, "FAIL build_table_html: missing <table>"
+    assert "<th>a</th>" in html, "FAIL build_table_html: header cell missing"
+    assert "<td>1</td>" in html, "FAIL build_table_html: body cell missing"
+    # Ensure HTML escaping is applied for special chars.
+    html2 = build_table_html(["x & y"], [["<b>bold</b>"]])
+    assert "&amp;" in html2, "FAIL build_table_html: ampersand not escaped"
+    assert "&lt;b&gt;" in html2, "FAIL build_table_html: angle brackets not escaped"
+    print("OK  build_html:   table HTML + escaping OK")
+
+
 def main():
     print("=" * 70)
-    print("test_list_and_table.py - standalone logic verification")
+    print("test_list_and_table.py - real-implementation verification")
     print("=" * 70)
     test_list_removal_basic()
     test_list_removal_idempotent()
     test_table_detection()
     test_table_parse()
     test_split_text_around_tables()
+    test_build_table_html_smoke()
     print("=" * 70)
     print("ALL TESTS PASSED")
     print("=" * 70)
