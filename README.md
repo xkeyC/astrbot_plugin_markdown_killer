@@ -1,27 +1,44 @@
 # AstrBot插件：Markdown杀手
 
 ## 简介
-这是一个 AstrBot 插件，用于移除聊天输出中的 Markdown 格式。不仅能够自动处理 LLM 生成的内容，也支持开启“全局 Markdown 移除”以清理所有即将发送的话语。
+这是一个 AstrBot 插件，用于移除聊天输出中的 Markdown 格式。不仅能够自动处理 LLM 生成的内容，也支持开启“全局 Markdown 移除”以清理所有即将发送的话语。自 `0.2.0` 起，还支持将 Markdown 表格渲染为图片后嵌入消息。
 
 ## 功能
 - 自动检测并移除 LLM 回复中的 Markdown 格式（保留纯文本内容）。
-- **新增**: 提供全局控制开关，可拦截并清理所有即将发送的消息链中的 Markdown（对非 LLM 生成的消息也生效）。
+- **全局 Markdown 移除**: 可拦截并清理所有即将发送的消息链中的 Markdown（对非 LLM 生成的消息也生效）。
 - 在控制台输出移除 Markdown 的日志提醒，并区分独立来源（如 `[全局过滤]`）以便排查。
 - **保留 fork 优化**: 支持移除多余换行，避免分段发送时出现过多空行。
 - **全面优化的匹配算法**:
   - 智能识别数学公式，避免误删 `3 * 4 = 12`、`3*4*5` 等表达式中的星号。
   - 精确处理代码级别变量，杜绝误伤 `this_is_a_var` 里的下划线。
   - 深度支持格式化嵌套排版（如加粗内含斜体符号、嵌套的多层级引用等）。
-  - 全面涵盖多类 Markdown 语法（代码块、行内代码、标题、独立链接与图片、引用、多符无序列表、删除线等）。
+  - 全面涵盖多类 Markdown 语法（代码块、行内代码、标题、独立链接与图片、引用、无序/有序列表、删除线等）。
+
+## 新版特性 (0.2.0)
+- **列表项处理改进**: 合并连续列表项到同一行，避免被分段发送时拆分为多条消息。
+  - 无序列表 `- a\n- b\n- c` → `a; b; c`
+  - 有序列表 `1. 第一步\n2. 第二步\n3. 第三步` → `1)第一步 2)第二步 3)第三步`
+- **新增表格图片渲染**: 使用 Playwright 将 Markdown 表格渲染为图片后嵌入消息链。
+  - 渲染失败时支持三种回退策略：`text`（转为纯文本）、`raw`（保留原始 Markdown）、`remove`（丢弃）。
+  - 渲染在 `on_decorating_result` 阶段执行，发生于分段发送之前，因此表格图片不会被分段拆散。
+- **新增配置项**:
+  - `enable_table_render`（默认 `true`）：是否启用表格图片渲染。
+  - `table_render_fallback`（默认 `text`）：表格渲染失败时的回退策略。
+- **新增依赖**: `playwright`（首次启用表格渲染时，插件会自动执行 `python -m playwright install chromium` 安装浏览器）。
+
+> 表格图片渲染的灵感与参考来源：[astrbot_plugin_biliVideo](https://github.com/xkeyC/astrbot_plugin_biliVideo) / [astrbot_plugin_bangumi](https://github.com/xkeyC/astrbot_plugin_bangumi)。
 
 ## 注意事项
 - 插件会尝试智能区分 Markdown 斜体和数学公式，但在极少数复杂边缘情况下可能会有误判。
 - 代码块的语言标识符（如 `python`）会被移除，但如果标识符后紧跟内容且无空格（如 ` ```json{...}``` `），可能会保留标识符以避免误删代码内容。
+- 表格图片渲染需要 `playwright` 与 Chromium 浏览器。插件首次启用时会尝试自动安装；若安装失败（网络问题、无权限等），将自动降级到回退策略，不影响其它功能。
+- 流式输出（STREAMING_FINISH）场景下，表格 Markdown 会原样流式输出给用户，插件不会再将其渲染为图片（修复流式表格需要更底层的改动，超出本期范围）。
 
 ## 安装
 1. 将本插件目录放置在 AstrBot 的 `data/plugins` 目录下。
 2. 确保 `metadata.yaml` 配置正确。
-3. 重启 AstrBot 或重载插件。
+3. 插件依赖 `playwright`（用于表格渲染）；如未安装，可执行 `pip install -r requirements.txt`。
+4. 重启 AstrBot 或重载插件。
 
 ## 配置
 在 AstrBot 的 WebUI 插件管理面板中支持配置以下项：
@@ -29,6 +46,8 @@
 - **全局 Markdown 移除 (`enable_global_markdown_killer`)**：布尔开关，默认为关闭。开启后，将从所有即将发送的最终文本消息中严格移除 Markdown 格式（不论该内容最初由谁产生）。
 - **移除多余的换行符 (`remove_extra_newlines`)**：布尔开关，默认为开启。启用后，将移除文本中多余的换行，避免分段发送时出现过多空行。
 - **换行处理模式 (`newline_mode`)**：默认为 `segment_boundary`。可选 `segment_boundary`（只移除分段标点后的换行，推荐）或 `global`（全局压缩连续空行）。
+- **启用表格图片渲染 (`enable_table_render`)**：布尔开关，默认为开启。开启后，LLM 回复中的 Markdown 表格将被 Playwright 渲染为图片并嵌入消息链。需要安装 `playwright` 与 Chromium（首次启用时插件会尝试自动安装）。
+- **表格渲染失败回退策略 (`table_render_fallback`)**：默认为 `text`。可选 `text`（转为纯文本，去分隔行）、`raw`（保留原始 Markdown 表格文本）、`remove`（直接丢弃表格内容）。
 
 ## 作者
 xkeyC（fork 维护）
