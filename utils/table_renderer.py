@@ -67,39 +67,61 @@ def build_table_html(header_cells: list[str], body_rows: list[list[str]]) -> str
         f"<tbody>{body_html}</tbody></table>"
     )
 
+    # NOTE: cells are escaped with html.escape(quote=False) only; we do NOT
+    # convert markdown `` `code` `` syntax inside cells to <code> tags. The
+    # ``code`` CSS rule below is forward-compat: if a future commit adds
+    # inline-code parsing, the styling will already match GitHub's look.
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
 * {{ margin: 0; padding: 0; box-sizing: border-box; }}
 body {{
-  font-family: 'Microsoft YaHei', 'PingFang SC', 'Hiragino Sans GB', sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif, 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB';
   background: transparent;
   padding: 12px;
+  display: inline-block;
 }}
 table {{
   border-collapse: collapse;
   background: #ffffff;
-  border-radius: 8px;
+  border: 1px solid #d0d7de;
+  border-radius: 6px;
   overflow: hidden;
-  box-shadow: 0 2px 8px rgba(0,0,0,.08);
-  font-size: 15px;
-  color: #333;
+  font-size: 14px;
+  color: #1f2328;
+}}
+thead {{
+  background-color: #f6f8fa;
+  border-bottom: 1px solid #d0d7de;
 }}
 th {{
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  color: #ffffff;
-  padding: 12px 16px;
+  padding: 8px 13px;
   font-weight: 600;
   text-align: left;
-  border: 1px solid #5a6ab8;
+  border-right: 1px solid #d0d7de;
+  white-space: nowrap;
+}}
+th:last-child {{
+  border-right: none;
 }}
 td {{
-  padding: 10px 16px;
-  border: 1px solid #e0e0e0;
-  background: #ffffff;
+  padding: 8px 13px;
+  border-top: 1px solid #d0d7de;
+  border-right: 1px solid #d0d7de;
+  vertical-align: top;
 }}
-tbody tr:nth-child(even) td {{
-  background: #f8f9ff;
+td:last-child {{
+  border-right: none;
+}}
+tbody tr:nth-child(2n) {{
+  background-color: #f6f8fa;
+}}
+code {{
+  font-family: ui-monospace, SFMono-Regular, 'SF Mono', Menlo, Consolas, 'Liberation Mono', monospace;
+  background: rgba(175, 184, 193, 0.2);
+  padding: 0.2em 0.4em;
+  border-radius: 6px;
+  font-size: 85%;
 }}
 </style></head>
 <body>
