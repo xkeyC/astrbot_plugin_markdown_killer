@@ -37,7 +37,7 @@ import time
     "astrbot_plugin_markdown_killer",
     "xkeyC",
     "移除输出中的Markdown格式（修正列表换行、新增表格图片渲染、列表字数自适应）",
-    "0.2.3",
+    "0.2.4",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):
@@ -244,56 +244,18 @@ class MarkdownKillerPlugin(Star):
                             logger.debug(fallback_msg)
         result.chain = new_chain
 
-        # Squash all Plain components into one so segmented_reply (which runs
-        # AFTER this hook) won't split the surrounding text away from the
-        # rendered table image(s). segmented_reply splits any Plain shorter
-        # than words_count_threshold (default 50 chars) into its own message,
-        # which used to turn `[Plain1, Image, Plain2]` into 3 messages.
-        # After squash, the chain is `[Plain_merged, Image, ...]` with one
-        # long Plain that bypasses segmentation in typical LLM responses.
-        has_plain = any(isinstance(c, Comp.Plain) for c in result.chain)
+        # Set disable_segment_reply so RespondStage sends the entire chain
+        # (text + table images + text) as ONE message instead of splitting
+        # each component into a separate message. This preserves the
+        # original interleaved order (text → table image → text → ...).
         has_image = any(isinstance(c, Comp.Image) for c in result.chain)
-        if has_plain and has_image:
-            self._squash_plains_for_single_message(result)
+        if has_image:
+            result.disable_segment_reply = True
 
         elapsed = time.perf_counter() - start_ts
         logger.info(
             f"[MarkdownKiller] 渲染 {len(jobs)} 个表格，耗时 {elapsed:.2f}s"
         )
-
-    def _squash_plains_for_single_message(self, result) -> None:
-        """Merge all Plain components into the first one (joined with ``\\n\\n``)
-        so segmented_reply sees one long Plain and doesn't split the
-        surrounding text away from the table image(s).
-
-        Non-Plain components (Image, etc.) retain their original positions.
-        The merged Plain takes the position of the FIRST Plain in the chain.
-
-        Why not ``result.squash_plain()``? AstrBot's built-in joins with
-        ``""`` (no separator), which would concatenate ``"前文"`` and
-        ``"后文"`` into ``"前文后文"`` with no paragraph break. Joining with
-        ``\\n\\n`` preserves paragraph structure between originally-separate
-        Plain segments.
-        """
-        if not result.chain:
-            return
-        plain_texts: list[str] = []
-        first_plain_idx: int | None = None
-        for idx, comp in enumerate(result.chain):
-            if isinstance(comp, Comp.Plain):
-                if first_plain_idx is None:
-                    first_plain_idx = idx
-                plain_texts.append(comp.text)
-        if first_plain_idx is None or len(plain_texts) < 2:
-            return  # nothing to squash
-        # Mutate the first Plain's text and drop the others.
-        result.chain[first_plain_idx].text = "\n\n".join(plain_texts)
-        new_chain = []
-        for idx, comp in enumerate(result.chain):
-            if isinstance(comp, Comp.Plain) and idx != first_plain_idx:
-                continue
-            new_chain.append(comp)
-        result.chain = new_chain
 
     def _apply_table_fallback(self, table_md: str) -> str | None:
         """Return fallback text for a table block according to table_render_fallback config."""
