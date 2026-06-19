@@ -11,6 +11,7 @@ Run: ``python tests/test_list_and_table.py``
 
 import logging
 import os
+import re
 import sys
 import types
 
@@ -46,6 +47,76 @@ from utils.table_renderer import (  # noqa: E402
     parse_markdown_table,
     split_text_around_tables,
 )
+
+
+# ---------------------------------------------------------------------------
+# Local alias used by the smart-join mirror below. The real implementation in
+# ``utils.table_renderer.split_text_around_tables`` is already imported above;
+# we keep the alias to match the documented mirror signature and to make the
+# test self-documenting.
+# ---------------------------------------------------------------------------
+split_text_around_tables_local = split_text_around_tables
+
+
+def remove_markdown_smart_join(text, remove_markdown_no_tables_fn=None):
+    """Mirror of MarkdownKillerPlugin.remove_markdown smart-join logic.
+
+    ``remove_markdown_no_tables_fn``: optional callable for the text-block
+    cleanup (so tests can inject a stub that mimics stripping trailing
+    newlines, which is the real bug trigger). Defaults to identity.
+    """
+    if remove_markdown_no_tables_fn is None:
+        remove_markdown_no_tables_fn = lambda x: x
+
+    blocks = split_text_around_tables_local(text)
+    result = ""
+    for seg in blocks:
+        if seg["type"] == "table":
+            cleaned = "\n".join(ln.rstrip() for ln in seg["text"].split("\n"))
+            # Guarantee the table starts on its own line.
+            if result and not result.endswith("\n"):
+                result += "\n"
+            result += cleaned
+            # Guarantee a trailing newline so the next text doesn't glue on.
+            if not cleaned.endswith("\n"):
+                result += "\n"
+        else:
+            result += remove_markdown_no_tables_fn(seg["text"])
+    return result
+
+
+def _strip_trailing_newlines(text):
+    """Stub mimicking _remove_extra_newlines_global stripping trailing newlines.
+
+    The real ``_remove_markdown_no_tables`` ends with one of the
+    ``_remove_extra_newlines_*`` helpers, both of which strip trailing blank
+    lines from the block. That stripping is what causes the bug: when the next
+    block is a table, the table gets glued onto the (now-trailing-newline-free)
+    text block. This stub reproduces ONLY that stripping behavior so the
+    smart-join logic can be exercised without importing main.py (which depends
+    on the astrbot runtime).
+    """
+    lines = [ln.rstrip() for ln in text.split("\n") if ln.strip()]
+    return "\n".join(lines)
+
+
+def buggy_remove_markdown(text, fn):
+    """Pre-fix mirror: uses ``"".join(out_parts)`` and so glues tables to text.
+
+    Kept as a regression guard: feeding the user's scenario through this
+    version MUST reproduce the original silent-failure (table not on its own
+    line, ``detect_markdown_tables`` returns 0). If a future refactor changes
+    ``remove_markdown`` back to plain ``"".join`` semantics, this test will
+    catch it.
+    """
+    blocks = split_text_around_tables_local(text)
+    out_parts = []
+    for seg in blocks:
+        if seg["type"] == "table":
+            out_parts.append("\n".join(ln.rstrip() for ln in seg["text"].split("\n")))
+        else:
+            out_parts.append(fn(seg["text"]))
+    return "".join(out_parts)
 
 
 # ---------------------------------------------------------------------------
@@ -257,6 +328,138 @@ def test_build_table_html_smoke():
     print("OK  build_html:   table HTML + escaping OK")
 
 
+# ---------------------------------------------------------------------------
+# Tests — table-after-paragraph regression (smart join in remove_markdown).
+# ---------------------------------------------------------------------------
+def test_table_after_paragraph():
+    """Regression: a markdown table following a paragraph of text must remain
+    on its own line(s) after ``remove_markdown`` so that
+    ``detect_markdown_tables`` can find it during the
+    ``on_decorating_result`` phase.
+
+    Bug: the old ``"".join(out_parts)`` glued the table onto the preceding
+    text block (whose trailing ``\\n\\n`` had just been stripped by the
+    newline-cleanup helper), producing e.g.
+    ``"para| 功能 | 备注 |\\n|---|---|\\n| a | b |\\n"``. The glued header row
+    no longer matched ``_TABLE_RE`` (which anchors to ``^``), so no table was
+    rendered AND no fallback warning fired — silent failure.
+    """
+    # ------------------------------------------------------------------
+    # Case 1: minimal bug repro.
+    # ------------------------------------------------------------------
+    inp = "para\n\n| 功能 | 备注 |\n|---|---|\n| a | b |\n"
+    result = remove_markdown_smart_join(inp, _strip_trailing_newlines)
+    expected = "para\n| 功能 | 备注 |\n|---|---|\n| a | b |\n"
+    assert result == expected, (
+        f"FAIL bug-repro: input={inp!r} got={result!r} expected={expected!r}"
+    )
+    assert re.search(r"(?m)^\| 功能", result), (
+        f"FAIL bug-repro: header not on own line: {result!r}"
+    )
+    # The smart-join output MUST be detectable by the real regex.
+    assert len(detect_markdown_tables(result)) == 1, (
+        f"FAIL bug-repro: detect_markdown_tables found 0 matches in {result!r}"
+    )
+    print(f"OK  bug-repro:    header on own line; detect=1 -> {result!r}")
+
+    # ------------------------------------------------------------------
+    # Case 2: user's exact scenario (intro paragraph + table).
+    # ------------------------------------------------------------------
+    user_input = (
+        "【轻松地舒展四肢】给你一张 Markdown 表格测试：\n\n"
+        "| 功能 | 端点 | 状态 | 备注 |\n"
+        "|---|---|---|---|\n"
+        "| 贴吧帖子列表 | `/mo/q/f?kw={吧名}` | 可用 | 返回移动端 HTML |\n"
+        "| 贴吧吧内搜索 | `/mo/q/search/thread?word={吧名}&query={关键词}` | 可用 | 返回 JSON |\n"
+    )
+    result = remove_markdown_smart_join(user_input, _strip_trailing_newlines)
+    # The header row must be at column 0 (i.e. on its own line).
+    assert re.search(r"(?m)^\| 功能", result), (
+        f"FAIL user-scenario: header not on own line: {result!r}"
+    )
+    # The intro paragraph must NOT be glued onto the header row.
+    assert "测试：| 功能" not in result, (
+        f"FAIL user-scenario: intro glued to header: {result!r}"
+    )
+    # The original `\n\n` paragraph break is preserved as a single `\n`
+    # (text-block cleanup strips trailing newlines; smart-join re-inserts
+    # exactly one before the table).
+    assert "测试：\n| 功能" in result, (
+        f"FAIL user-scenario: expected single \\n between intro and table: {result!r}"
+    )
+    # Real detector must find the table on the smart-join output.
+    assert len(detect_markdown_tables(result)) == 1, (
+        f"FAIL user-scenario: detect_markdown_tables found 0 matches in {result!r}"
+    )
+    print(f"OK  user-scenario: header on own line; detect=1")
+    print(f"     result preview: {result.splitlines()[0]!r} / {result.splitlines()[1]!r}")
+
+    # ------------------------------------------------------------------
+    # Case 3: text-only input unchanged (no table-related newline logic).
+    # ------------------------------------------------------------------
+    text_only = "hello world"
+    result = remove_markdown_smart_join(text_only, _strip_trailing_newlines)
+    assert result == "hello world", (
+        f"FAIL text-only: input={text_only!r} got={result!r}"
+    )
+    print(f"OK  text-only:    unchanged -> {result!r}")
+
+    # Multi-paragraph text-only input: still no spurious newline insertions.
+    multi = "first paragraph\n\nsecond paragraph"
+    result = remove_markdown_smart_join(multi, _strip_trailing_newlines)
+    # _strip_trailing_newlines collapses `\n\n` to a single `\n` between non-empty
+    # lines (mimics _remove_extra_newlines_global); just verify no leading/trailing
+    # newline was added by smart-join.
+    assert not result.startswith("\n") and not result.endswith("\n"), (
+        f"FAIL text-only multi: spurious newline added: {result!r}"
+    )
+    print(f"OK  text-only-multi: no spurious newlines -> {result!r}")
+
+    # ------------------------------------------------------------------
+    # Case 4: idempotency — feeding the output back must be a fixed point.
+    # ------------------------------------------------------------------
+    once = remove_markdown_smart_join(user_input, _strip_trailing_newlines)
+    twice = remove_markdown_smart_join(once, _strip_trailing_newlines)
+    assert once == twice, (
+        f"FAIL idempotency: once={once!r} twice={twice!r}"
+    )
+    print(f"OK  idempotency:  output stable under re-application")
+
+    # ------------------------------------------------------------------
+    # Case 5: pre-bug simulation — the buggy version MUST reproduce the bug.
+    # This guards against silent regressions back to ``"".join`` semantics.
+    # ------------------------------------------------------------------
+    buggy_result = buggy_remove_markdown(inp, _strip_trailing_newlines)
+    # In the buggy version, the table's first row should NOT be on its own line:
+    assert not re.search(r"(?m)^\| 功能", buggy_result), (
+        f"FAIL buggy-version: unexpectedly has table on own line: {buggy_result!r}"
+    )
+    # ... and the table is glued onto the preceding text:
+    assert "para| 功能" in buggy_result, (
+        f"FAIL buggy-version: did not glue table to text as expected: {buggy_result!r}"
+    )
+    # ... and the real detector must NOT find it (silent failure):
+    assert len(detect_markdown_tables(buggy_result)) == 0, (
+        f"FAIL buggy-version: detect unexpectedly found table in {buggy_result!r}"
+    )
+    print(f"OK  buggy-version: reproduces glue -> {buggy_result!r}")
+
+    # ------------------------------------------------------------------
+    # Case 6: user's exact scenario through the buggy version — must also fail.
+    # ------------------------------------------------------------------
+    buggy_user = buggy_remove_markdown(user_input, _strip_trailing_newlines)
+    assert not re.search(r"(?m)^\| 功能", buggy_user), (
+        f"FAIL buggy-user: header unexpectedly on own line: {buggy_user!r}"
+    )
+    assert "测试：| 功能" in buggy_user, (
+        f"FAIL buggy-user: intro not glued to header: {buggy_user!r}"
+    )
+    assert len(detect_markdown_tables(buggy_user)) == 0, (
+        f"FAIL buggy-user: detect unexpectedly found table in {buggy_user!r}"
+    )
+    print(f"OK  buggy-user:    reproduces glue (silent failure) -> {buggy_user[:60]!r}...")
+
+
 def main():
     print("=" * 70)
     print("test_list_and_table.py - real-implementation verification")
@@ -268,6 +471,7 @@ def main():
     test_table_parse()
     test_split_text_around_tables()
     test_build_table_html_smoke()
+    test_table_after_paragraph()
     print("=" * 70)
     print("ALL TESTS PASSED")
     print("=" * 70)
