@@ -39,11 +39,28 @@ class EnvManager:
             logger.debug(f"Playwright 环境验证失败: {e}")
             return False
 
+    @staticmethod
+    async def _kill_process(process: asyncio.subprocess.Process) -> None:
+        """Best-effort kill+wait of a subprocess. Swallows all exceptions."""
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        except Exception:
+            pass
+        try:
+            await process.wait()
+        except Exception:
+            pass
+
     async def install_dependencies(self) -> None:
         """Run ``python -m playwright install chromium`` and write the flag file on success.
 
-        A 5-minute (300s) timeout guards against stalled network installs (N5):
-        on timeout we kill the subprocess and return without writing the flag
+        Two-layer 300s timeout protects against both:
+        - process hangs after stdout closes (via ``wait_for(process.wait())``);
+        - process stalls mid-stream (via ``wait_for(readline())`` on every line).
+
+        On timeout we kill the subprocess and return without writing the flag
         file, so the next run will retry.
         """
         logger.info("正在初始化插件依赖 (Playwright)...")
@@ -55,13 +72,27 @@ class EnvManager:
                 stderr=asyncio.subprocess.STDOUT,
             )
 
+            timed_out = False
             while True:
-                line = await process.stdout.readline()
+                try:
+                    line = await asyncio.wait_for(
+                        process.stdout.readline(), timeout=300
+                    )
+                except asyncio.TimeoutError:
+                    logger.error(
+                        "Playwright Chromium 安装超时 (300s 无输出)，请检查网络或手动安装"
+                    )
+                    timed_out = True
+                    break
                 if not line:
                     break
                 msg = line.decode(errors="ignore").strip()
                 if msg:
                     logger.info(f"[Playwright] {msg}")
+
+            if timed_out:
+                await self._kill_process(process)
+                return
 
             try:
                 await asyncio.wait_for(process.wait(), timeout=300)
@@ -69,16 +100,7 @@ class EnvManager:
                 logger.error(
                     "Playwright Chromium 安装超时 (300s)，请检查网络或手动安装"
                 )
-                try:
-                    process.kill()
-                except ProcessLookupError:
-                    pass
-                except Exception:
-                    pass
-                try:
-                    await process.wait()
-                except Exception:
-                    pass
+                await self._kill_process(process)
                 return
 
             if process.returncode == 0:

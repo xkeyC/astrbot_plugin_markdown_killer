@@ -16,9 +16,6 @@ _TABLE_RE = re.compile(
     re.MULTILINE,
 )
 
-_UNORD_LIST_RE = re.compile(r"^(\s*)[-*+]\s+(.+?)\s*$")
-_ORD_LIST_RE = re.compile(r"^(\s*)(\d+)[.)]\s+(.+?)\s*$")
-
 
 def detect_markdown_tables(text: str) -> list[tuple[int, int, str]]:
     """Find all markdown table blocks in ``text``.
