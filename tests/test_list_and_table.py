@@ -120,38 +120,36 @@ def buggy_remove_markdown(text, fn):
 
 
 # ---------------------------------------------------------------------------
-# Tests — list-marker removal (basic + idempotency).
+# Tests — list marker/newline preservation (basic + idempotency).
 # ---------------------------------------------------------------------------
 def test_list_removal_basic():
     cases = [
-        ("- a\n- b\n- c", "a; b; c"),
-        ("* a\n* b", "a; b"),
-        ("1. First\n2. Second\n3. Third", "1)First 2)Second 3)Third"),
-        ("1) First\n2) Second", "1)First 2)Second"),
-        ("Before\n- a\n- b\nAfter", "Before\na; b\nAfter"),
-        # N7: nested sub-list markers stripped when consumed as continuation.
-        ("- main\n  - sub1\n  - sub2\n- next", "main sub1 sub2; next"),
-        # N7: non-marker continuation, unchanged behavior.
-        ("- main\n  more details", "main more details"),
-        # N7: ordered + indented non-marker continuation.
-        ("1. 第一步\n   子说明\n2. 第二步", "1)第一步 子说明 2)第二步"),
+        ("- a\n- b\n- c", "- a\n- b\n- c"),
+        ("* a\n* b", "* a\n* b"),
+        ("+ a\n+ b", "+ a\n+ b"),
+        ("1. First\n2. Second\n3. Third", "1. First\n2. Second\n3. Third"),
+        ("1) First\n2) Second", "1) First\n2) Second"),
+        ("Before\n- a\n- b\nAfter", "Before\n- a\n- b\nAfter"),
+        ("- main\n  - sub1\n  - sub2\n- next", "- main\n  - sub1\n  - sub2\n- next"),
+        ("- main\n  more details", "- main\n  more details"),
+        ("1. 第一步\n   子说明\n2. 第二步", "1. 第一步\n   子说明\n2. 第二步"),
     ]
     for inp, expected in cases:
         actual = remove_list_markers(inp)
         assert actual == expected, (
-            f"FAIL list-removal: {inp!r} -> {actual!r} (expected {expected!r})"
+            f"FAIL list-preserve: {inp!r} -> {actual!r} (expected {expected!r})"
         )
-        print(f"OK  list-removal: {inp!r} -> {actual!r}")
+        print(f"OK  list-preserve: {inp!r} -> {actual!r}")
 
 
 def test_list_removal_idempotent():
     cases = [
         "- a\n- b\n- c",
         "* a\n* b",
+        "+ a\n+ b",
         "1. First\n2. Second\n3. Third",
         "1) First\n2) Second",
         "Before\n- a\n- b\nAfter",
-        # N7 cases must also be stable under re-application.
         "- main\n  - sub1\n  - sub2\n- next",
         "- main\n  more details",
         "1. 第一步\n   子说明\n2. 第二步",
@@ -166,105 +164,170 @@ def test_list_removal_idempotent():
 
 
 def test_list_removal_adaptive_merge():
-    """Adaptive merge: short lists merge to one line, long lists keep multi-line."""
-    # --- Short lists (default threshold 30): merge to one line (unchanged) ---
-    short_cases = [
-        ("- a\n- b\n- c", "a; b; c"),
-        ("1. First\n2. Second\n3. Third", "1)First 2)Second 3)Third"),
-    ]
-    for inp, expected in short_cases:
-        actual = remove_list_markers(inp)  # default threshold 30
-        assert actual == expected, (
-            f"FAIL short-list merge: {inp!r} -> {actual!r} (expected {expected!r})"
-        )
-        print(f"OK  short-merge:  {inp!r} -> {actual!r}")
+    """Short and long lists both preserve markers and per-item newlines now."""
+    short_ord = "1. **短内容**\n2. 中等内容"
+    short_ord_expected = "1. 短内容\n2. 中等内容"
+    actual = remove_list_markers(short_ord)
+    assert actual == short_ord_expected, (
+        f"FAIL short-ordered preserve: {actual!r} (expected {short_ord_expected!r})"
+    )
+    print(f"OK  short-ord:    markers/newlines preserved -> {actual!r}")
 
-    # --- Long unordered list (total_chars=46 > 30): preserve multi-line ---
+    short_unord = "- **项目**\n* `代码`\n+ ~~删除~~"
+    short_unord_expected = "- 项目\n* 代码\n+ 删除"
+    actual = remove_list_markers(short_unord, merge_threshold=0)
+    assert actual == short_unord_expected, (
+        f"FAIL short-unordered preserve: {actual!r} (expected {short_unord_expected!r})"
+    )
+    print(f"OK  short-unord:  marker shapes preserved despite threshold=0 -> {actual!r}")
+
     long_unord_in = (
         "- 第一项这是一段比较长的说明文字\n"
         "- 第二项也是一段比较长的说明文字\n"
         "- 第三项依旧是一段比较长的说明文字"
     )
-    long_unord_expected = (
-        "第一项这是一段比较长的说明文字\n"
-        "第二项也是一段比较长的说明文字\n"
-        "第三项依旧是一段比较长的说明文字"
-    )
     actual = remove_list_markers(long_unord_in)
-    assert actual == long_unord_expected, (
-        f"FAIL long-unord preserve: {actual!r} (expected {long_unord_expected!r})"
+    assert actual == long_unord_in, (
+        f"FAIL long-unord preserve: {actual!r} (expected {long_unord_in!r})"
     )
-    print(f"OK  long-unord:   3 items, multi-line preserved, markers stripped")
+    print("OK  long-unord:   markers and multi-line layout preserved")
 
-    # --- Long ordered list (the user's example; total_chars=140 > 30) ---
     long_ord_in = (
         "1. 第一步：准备工作，确保已安装 Python 3.10 或以上版本。\n"
         "2. 第二步：克隆仓库到本地，使用 git clone 命令。\n"
         "3. 第三步：进入项目目录，运行 pip install -r requirements.txt。\n"
         "4. 第四步：启动 AstrBot，使用 uv run main.py。"
     )
-    long_ord_expected = (
-        "第一步：准备工作，确保已安装 Python 3.10 或以上版本。\n"
-        "第二步：克隆仓库到本地，使用 git clone 命令。\n"
-        "第三步：进入项目目录，运行 pip install -r requirements.txt。\n"
-        "第四步：启动 AstrBot，使用 uv run main.py。"
-    )
     actual = remove_list_markers(long_ord_in)
-    assert actual == long_ord_expected, (
-        f"FAIL long-ord preserve: {actual!r} (expected {long_ord_expected!r})"
+    assert actual == long_ord_in, (
+        f"FAIL long-ord preserve: {actual!r} (expected {long_ord_in!r})"
     )
-    print(f"OK  long-ord:     4 items (user example), multi-line preserved, "
-          f"number prefixes dropped")
+    assert actual.splitlines()[0].startswith("1. ")
+    assert actual.splitlines()[1].startswith("2. ")
+    print("OK  long-ord:     original numbering and item newlines preserved")
 
-    # Verify: no remaining list markers in the long-ordered output.
-    for ln in actual.split("\n"):
-        assert not ln.startswith(("1.", "1)", "-", "*", "+")), (
-            f"FAIL long-ord: line still has marker: {ln!r}"
-        )
 
-    # --- Threshold escape hatch: merge_threshold=0 forces unconditional merge ---
-    esc1_in = (
-        "- 第一项这是一段比较长的说明文字\n"
-        "- 第二项也是一段比较长的说明文字"
-    )
-    esc1_expected = (
-        "第一项这是一段比较长的说明文字; 第二项也是一段比较长的说明文字"
-    )
-    actual = remove_list_markers(esc1_in, merge_threshold=0)
-    assert actual == esc1_expected, (
-        f"FAIL escape-hatch 0: {actual!r} (expected {esc1_expected!r})"
-    )
-    print(f"OK  escape-0:     threshold=0 forces merge -> {actual!r}")
+def _load_plugin_class_for_tests():
+    """Import main.py with minimal AstrBot stubs for newline-cleanup coverage."""
+    _astrbot_api_pkg.AstrBotConfig = dict
 
-    # merge_threshold=100 keeps short list merging as normal (under threshold).
-    esc2_actual = remove_list_markers("- a\n- b", merge_threshold=100)
-    assert esc2_actual == "a; b", (
-        f"FAIL escape-100: {esc2_actual!r} (expected 'a; b')"
-    )
-    print(f"OK  escape-100:   threshold=100, short list merged -> {esc2_actual!r}")
+    class _Plain:
+        def __init__(self, text=""):
+            self.text = text
 
-    # --- Explicit threshold, unambiguous direction ---
-    # total_chars=3 <= 5 -> merge.
-    t1_actual = remove_list_markers("- a\n- b\n- c", merge_threshold=5)
-    assert t1_actual == "a; b; c", (
-        f"FAIL explicit-thr-5: {t1_actual!r} (expected 'a; b; c')"
-    )
-    print(f"OK  explicit-5:   {t1_actual!r}")
+    class _Image:
+        @classmethod
+        def fromBytes(cls, _data):
+            return cls()
 
-    # total_chars=6 > 4 -> preserve multi-line.
-    t2_actual = remove_list_markers("- abc\n- def", merge_threshold=4)
-    assert t2_actual == "abc\ndef", (
-        f"FAIL explicit-thr-4: {t2_actual!r} (expected 'abc\\ndef')"
+    _astrbot_api_pkg.message_components = types.SimpleNamespace(
+        Plain=_Plain,
+        Image=_Image,
     )
-    print(f"OK  explicit-4:   {t2_actual!r}")
 
-    # --- Idempotency on long-list output ---
-    long_out = remove_list_markers(long_ord_in)
-    long_out_twice = remove_list_markers(long_out)
-    assert long_out == long_out_twice, (
-        f"FAIL long-list idempotency: once={long_out!r} twice={long_out_twice!r}"
+    event_pkg = types.ModuleType("astrbot.api.event")
+
+    class _Filter:
+        @staticmethod
+        def on_llm_response(*_args, **_kwargs):
+            return lambda fn: fn
+
+        @staticmethod
+        def on_decorating_result(*_args, **_kwargs):
+            return lambda fn: fn
+
+    event_pkg.AstrMessageEvent = object
+    event_pkg.filter = _Filter
+    sys.modules["astrbot.api.event"] = event_pkg
+
+    provider_pkg = types.ModuleType("astrbot.api.provider")
+    provider_pkg.LLMResponse = object
+    sys.modules["astrbot.api.provider"] = provider_pkg
+
+    star_pkg = types.ModuleType("astrbot.api.star")
+
+    class _Star:
+        def __init__(self, _context):
+            pass
+
+    class _StarTools:
+        @staticmethod
+        def get_data_dir(_name):
+            return "."
+
+    def _register(*_args, **_kwargs):
+        return lambda cls: cls
+
+    star_pkg.Context = object
+    star_pkg.Star = _Star
+    star_pkg.StarTools = _StarTools
+    star_pkg.register = _register
+    sys.modules["astrbot.api.star"] = star_pkg
+
+    core_pkg = types.ModuleType("astrbot.core")
+    message_pkg = types.ModuleType("astrbot.core.message")
+    result_pkg = types.ModuleType("astrbot.core.message.message_event_result")
+    result_pkg.ResultContentType = types.SimpleNamespace(
+        STREAMING_FINISH="STREAMING_FINISH"
     )
-    print(f"OK  long-idem:    long-list output stable under re-application")
+    sys.modules["astrbot.core"] = core_pkg
+    sys.modules["astrbot.core.message"] = message_pkg
+    sys.modules["astrbot.core.message.message_event_result"] = result_pkg
+
+    from main import MarkdownKillerPlugin  # noqa: E402
+
+    return MarkdownKillerPlugin
+
+
+def _new_plugin_for_tests():
+    plugin_cls = _load_plugin_class_for_tests()
+    plugin = plugin_cls.__new__(plugin_cls)
+    plugin.remove_extra_newlines = True
+    plugin.newline_mode = "segment_boundary"
+    plugin.list_merge_char_threshold = 30
+    return plugin
+
+
+def test_remove_markdown_preserves_list_newlines():
+    """Main newline cleanup must not flatten list-item newlines."""
+    plugin = _new_plugin_for_tests()
+
+    ordered = "1. **短内容。**\n2. 中等内容。\n3. `代码`。"
+    ordered_expected = "1. 短内容。\n2. 中等内容。\n3. 代码。"
+    actual = plugin._remove_markdown_no_tables(ordered)
+    assert actual == ordered_expected, (
+        f"FAIL ordered cleanup: {actual!r} (expected {ordered_expected!r})"
+    )
+    print(f"OK  ordered-main: formatting stripped, list newlines kept -> {actual!r}")
+
+    unordered = "- **项目。**\n* [链接](https://example.com)。\n+ ~~删除~~。"
+    unordered_expected = "- 项目。\n* 链接。\n+ 删除。"
+    actual = plugin._remove_markdown_no_tables(unordered)
+    assert actual == unordered_expected, (
+        f"FAIL unordered cleanup: {actual!r} (expected {unordered_expected!r})"
+    )
+    print(f"OK  unord-main:   marker shapes and newlines kept -> {actual!r}")
+
+    continuation = "- 第一项。\n  续行一。\n  续行二。\n结尾"
+    actual = plugin._remove_markdown_no_tables(continuation)
+    assert actual == continuation, (
+        f"FAIL list continuation cleanup: {actual!r} (expected {continuation!r})"
+    )
+    print("OK  list-cont:    indented continuation line breaks kept")
+
+    non_list_indented = "第一句。\n  缩进句。"
+    actual = plugin._remove_markdown_no_tables(non_list_indented)
+    assert actual == "第一句。  缩进句。", (
+        f"FAIL non-list indented cleanup: unexpected preservation: {actual!r}"
+    )
+    print(f"OK  non-list-ind: segment-boundary cleanup still applies -> {actual!r}")
+
+    paragraph = "第一句。\n\n第二句。"
+    actual = plugin._remove_markdown_no_tables(paragraph)
+    assert actual == "第一句。第二句。", (
+        f"FAIL paragraph cleanup: non-list newline behavior changed: {actual!r}"
+    )
+    print(f"OK  paragraph:    non-list segment-boundary cleanup unchanged -> {actual!r}")
 
 
 # ---------------------------------------------------------------------------
@@ -511,6 +574,7 @@ def main():
     test_list_removal_basic()
     test_list_removal_idempotent()
     test_list_removal_adaptive_merge()
+    test_remove_markdown_preserves_list_newlines()
     test_table_detection()
     test_table_parse()
     test_split_text_around_tables()
@@ -524,6 +588,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
-
