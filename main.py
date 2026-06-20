@@ -32,12 +32,14 @@ import asyncio
 import re
 import time
 
+_LIST_ITEM_LINE_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)")
+
 
 @register(
     "astrbot_plugin_markdown_killer",
     "xkeyC",
-    "移除输出中的Markdown格式（修正列表换行、新增表格图片渲染、列表字数自适应）",
-    "0.2.4",
+    "移除输出中的Markdown格式（保留列表标记换行、支持表格图片渲染）",
+    "0.2.5",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):
@@ -308,10 +310,34 @@ class MarkdownKillerPlugin(Star):
             After split: ["第一句。", "\n\n第二句。"]
             Result: Extra blank lines before "第二句。"
 
-        Solution: Remove newlines right after segment punctuation.
+        Solution: Remove newlines right after segment punctuation, except when
+        either side of the newline is a Markdown list item. List item newlines
+        are part of the intended layout and must not be flattened.
         """
-        text = re.sub(r"([。？！~…])\n+", r"\1", text)
-        return text.strip()
+        parts = re.split(r"(\n+)", text)
+        if len(parts) == 1:
+            return text.strip()
+
+        result: list[str] = [parts[0]]
+        for index in range(1, len(parts), 2):
+            newlines = parts[index]
+            next_text = parts[index + 1] if index + 1 < len(parts) else ""
+            prev_line = result[-1].split("\n")[-1] if result else ""
+            next_line = next_text.split("\n", 1)[0]
+            prev_is_list = bool(_LIST_ITEM_LINE_RE.match(prev_line))
+            next_is_list = bool(_LIST_ITEM_LINE_RE.match(next_line))
+
+            if (
+                prev_line.rstrip().endswith(("。", "？", "！", "~", "…"))
+                and not prev_is_list
+                and not next_is_list
+            ):
+                result.append(next_text)
+            else:
+                result.append(newlines)
+                result.append(next_text)
+
+        return "".join(result).strip()
 
     def _remove_extra_newlines_global(self, text: str) -> str:
         """
@@ -347,22 +373,17 @@ class MarkdownKillerPlugin(Star):
         return [(seg["text"], seg["type"] == "table") for seg in segments]
 
     def _remove_list_markers(self, text: str) -> str:
-        """合并连续列表项到同一行，避免被分段发送时拆分为多条消息。
+        """保留列表标记与换行，仅清理列表项内容中的行内 Markdown 格式。
 
         实际逻辑已迁移至 ``utils/list_processor.py`` (纯标准库、可在测试中独立
         导入)，此处仅作薄包装以保留插件实例上的公共方法名 (向后兼容)。
 
-        自适应阈值来自配置项 ``list_merge_char_threshold`` (默认 30)：短列表
-        (总字数 ≤ 阈值) 合并到同一行；长列表保留多行布局仅去标记。
+        ``list_merge_char_threshold`` 配置项已废弃，仅为旧配置兼容继续传入。
 
         行为详见 ``utils.list_processor.remove_list_markers`` 的 docstring：
-        - 无序列表 [-*+]: 项与项之间用 `"; "` 连接，如 `a; b; c`。
-        - 有序列表 [N. / N)]: 标记替换为 `N)`（无空格），项之间用空格连接，
-          如 `1)First 2)Second 3)Third`。
-        - 空行会中断列表 run，生成多个合并行。
-        - 缩进的连续行作为上一项内容的延续；若该行本身也是列表标记 (缩进大于
-          父项)，则剥离标记前缀只保留内容，避免内层 `-` 残留为字面字符 (N7)。
-        - 当总字数超过 ``list_merge_char_threshold`` 时，每项独占一行仅去标记。
+        - 无序列表 [-*+]: 保留原标记形状与每项换行，如 `- 项目`。
+        - 有序列表 [N. / N)]: 保留原编号与分隔符，如 `1. 短内容`。
+        - 不再按长短合并列表项，也不再移除列表标记/编号。
         - 函数幂等：再次输入输出文本不会进一步改变。
         """
         return _remove_list_markers_impl(
@@ -428,7 +449,7 @@ class MarkdownKillerPlugin(Star):
         # 移除引用 (处理嵌套情况: >>> text -> text)
         text = re.sub(r"^(?:>\s*)+(.*)", r"\1", text, flags=re.MULTILINE)
 
-        # 移除列表标记 (无序 + 有序)，并将连续列表项合并到同一行
+        # 保留列表标记与列表项换行，仅清理列表项内容中的行内 Markdown 格式
         text = self._remove_list_markers(text)
 
         # Remove extra newlines if enabled
