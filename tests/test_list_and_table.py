@@ -308,6 +308,20 @@ def test_remove_markdown_preserves_list_newlines():
     )
     print(f"OK  unord-main:   marker shapes and newlines kept -> {actual!r}")
 
+    continuation = "- 第一项。\n  续行一。\n  续行二。\n结尾"
+    actual = plugin._remove_markdown_no_tables(continuation)
+    assert actual == continuation, (
+        f"FAIL list continuation cleanup: {actual!r} (expected {continuation!r})"
+    )
+    print("OK  list-cont:    indented continuation line breaks kept")
+
+    non_list_indented = "第一句。\n  缩进句。"
+    actual = plugin._remove_markdown_no_tables(non_list_indented)
+    assert actual == "第一句。  缩进句。", (
+        f"FAIL non-list indented cleanup: unexpected preservation: {actual!r}"
+    )
+    print(f"OK  non-list-ind: segment-boundary cleanup still applies -> {actual!r}")
+
     paragraph = "第一句。\n\n第二句。"
     actual = plugin._remove_markdown_no_tables(paragraph)
     assert actual == "第一句。第二句。", (

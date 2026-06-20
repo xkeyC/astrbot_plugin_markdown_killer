@@ -35,6 +35,26 @@ import time
 _LIST_ITEM_LINE_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)")
 
 
+def _is_list_context_line(
+    line: str, active_list_indent: int | None
+) -> tuple[bool, int | None]:
+    """Return whether ``line`` belongs to a Markdown list block.
+
+    Besides explicit marker lines, indented non-blank lines after a list marker
+    are Markdown list continuations and must keep their physical line breaks.
+    """
+    marker_match = _LIST_ITEM_LINE_RE.match(line)
+    if marker_match:
+        return True, len(line) - len(line.lstrip())
+
+    if active_list_indent is not None and line.strip():
+        indent = len(line) - len(line.lstrip())
+        if indent > active_list_indent:
+            return True, active_list_indent
+
+    return False, None
+
+
 @register(
     "astrbot_plugin_markdown_killer",
     "xkeyC",
@@ -311,26 +331,39 @@ class MarkdownKillerPlugin(Star):
             Result: Extra blank lines before "第二句。"
 
         Solution: Remove newlines right after segment punctuation, except when
-        either side of the newline is a Markdown list item. List item newlines
-        are part of the intended layout and must not be flattened.
+        either side of the newline belongs to a Markdown list block. This
+        includes explicit marker lines and indented continuation/wrapped lines.
         """
         parts = re.split(r"(\n+)", text)
         if len(parts) == 1:
             return text.strip()
+
+        lines = parts[::2]
+        list_context_lines: list[bool] = []
+        active_list_indent: int | None = None
+        for line in lines:
+            is_list_context, active_list_indent = _is_list_context_line(
+                line, active_list_indent
+            )
+            list_context_lines.append(is_list_context)
 
         result: list[str] = [parts[0]]
         for index in range(1, len(parts), 2):
             newlines = parts[index]
             next_text = parts[index + 1] if index + 1 < len(parts) else ""
             prev_line = result[-1].split("\n")[-1] if result else ""
-            next_line = next_text.split("\n", 1)[0]
-            prev_is_list = bool(_LIST_ITEM_LINE_RE.match(prev_line))
-            next_is_list = bool(_LIST_ITEM_LINE_RE.match(next_line))
+            line_index = index // 2
+            prev_is_list_context = list_context_lines[line_index]
+            next_is_list_context = (
+                list_context_lines[line_index + 1]
+                if line_index + 1 < len(list_context_lines)
+                else False
+            )
 
             if (
                 prev_line.rstrip().endswith(("。", "？", "！", "~", "…"))
-                and not prev_is_list
-                and not next_is_list
+                and not prev_is_list_context
+                and not next_is_list_context
             ):
                 result.append(next_text)
             else:
