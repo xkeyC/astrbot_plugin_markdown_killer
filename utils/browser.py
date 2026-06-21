@@ -21,6 +21,49 @@ _browser_instance = None
 _browser_lock = asyncio.Lock()
 
 
+def _as_positive_int(value, default: int = 1) -> int:
+    """Coerce a measured browser dimension to a positive integer."""
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
+
+
+def _calculate_screenshot_viewport(dimensions: dict, min_width: int) -> dict[str, int]:
+    """Choose a viewport large enough for the rendered target/document.
+
+    Playwright can render pages larger than the initial viewport, but element
+    screenshots are more reliable when the viewport is expanded to the measured
+    target/document dimensions first. This avoids clipping long or wide tables
+    at the old fixed 10000px viewport height or 1400px viewport width.
+    """
+    width_candidates = [min_width]
+    height_candidates = [1]
+    for key in (
+        "targetWidth",
+        "targetScrollWidth",
+        "targetOffsetWidth",
+        "targetRight",
+        "documentWidth",
+        "bodyWidth",
+    ):
+        width_candidates.append(_as_positive_int(dimensions.get(key)))
+    for key in (
+        "targetHeight",
+        "targetScrollHeight",
+        "targetOffsetHeight",
+        "targetBottom",
+        "documentHeight",
+        "bodyHeight",
+    ):
+        height_candidates.append(_as_positive_int(dimensions.get(key)))
+    return {
+        "width": max(width_candidates),
+        "height": max(height_candidates),
+    }
+
+
 async def get_browser():
     """Return a connected singleton browser, creating one if necessary.
 
@@ -94,6 +137,36 @@ async def close_browser():
         _playwright_instance = None
 
 
+async def _measure_rendered_dimensions(page, selector: str) -> dict:
+    """Measure the target element and full document in CSS pixels."""
+    return await page.evaluate(
+        """
+        (selector) => {
+            const target = document.querySelector(selector);
+            const rect = target ? target.getBoundingClientRect() : null;
+            const body = document.body;
+            const doc = document.documentElement;
+            const maxOf = (...values) => Math.ceil(Math.max(1, ...values.filter(Number.isFinite)));
+            return {
+                targetWidth: target ? maxOf(rect.width, target.scrollWidth, target.offsetWidth) : 0,
+                targetHeight: target ? maxOf(rect.height, target.scrollHeight, target.offsetHeight) : 0,
+                targetScrollWidth: target ? Math.ceil(target.scrollWidth || 0) : 0,
+                targetScrollHeight: target ? Math.ceil(target.scrollHeight || 0) : 0,
+                targetOffsetWidth: target ? Math.ceil(target.offsetWidth || 0) : 0,
+                targetOffsetHeight: target ? Math.ceil(target.offsetHeight || 0) : 0,
+                targetRight: rect ? Math.ceil(rect.right) : 0,
+                targetBottom: rect ? Math.ceil(rect.bottom) : 0,
+                documentWidth: maxOf(doc.scrollWidth, doc.offsetWidth, doc.clientWidth),
+                documentHeight: maxOf(doc.scrollHeight, doc.offsetHeight, doc.clientHeight),
+                bodyWidth: body ? maxOf(body.scrollWidth, body.offsetWidth, body.clientWidth) : 0,
+                bodyHeight: body ? maxOf(body.scrollHeight, body.offsetHeight, body.clientHeight) : 0,
+            };
+        }
+        """,
+        selector,
+    )
+
+
 async def render_html_to_image(
     html_content: str,
     selector: str = "body",
@@ -116,12 +189,23 @@ async def render_html_to_image(
         from playwright.async_api import ViewportSize
 
         context = await browser.new_context(
-            viewport=ViewportSize(width=width, height=10000),
+            viewport=ViewportSize(width=width, height=1000),
             device_scale_factor=scale_factor,
         )
         page = await context.new_page()
 
         await page.set_content(html_content, wait_until="networkidle", timeout=timeout)
+
+        dimensions = await _measure_rendered_dimensions(page, selector)
+        viewport = _calculate_screenshot_viewport(dimensions, min_width=width)
+        await page.set_viewport_size(viewport)
+
+        # Re-measure after the wider viewport settles because wrapping/layout can
+        # change once horizontal clipping is removed.
+        dimensions = await _measure_rendered_dimensions(page, selector)
+        updated_viewport = _calculate_screenshot_viewport(dimensions, min_width=width)
+        if updated_viewport != viewport:
+            await page.set_viewport_size(updated_viewport)
 
         locator = page.locator(selector)
         if await locator.count() > 0:

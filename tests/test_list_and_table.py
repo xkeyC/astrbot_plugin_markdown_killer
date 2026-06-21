@@ -45,8 +45,10 @@ from utils.table_renderer import (  # noqa: E402
     build_table_html,
     detect_markdown_tables,
     parse_markdown_table,
+    render_inline_markdown,
     split_text_around_tables,
 )
+from utils.browser import _calculate_screenshot_viewport  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -361,6 +363,33 @@ def test_table_parse():
     assert body == [["1", "2"]], f"FAIL parse body: {body!r}"
     print(f"OK  parse:        header={header!r} body={body!r}")
 
+    header, body = parse_markdown_table(
+        "| expr | note |\n|---|---|\n| `a | b` | escaped \\| pipe |\n"
+    )
+    assert header == ["expr", "note"], f"FAIL parse pipes header: {header!r}"
+    assert body == [["`a | b`", "escaped | pipe"]], (
+        f"FAIL parse pipes body: {body!r}"
+    )
+    print("OK  parse-pipes:  code/escaped pipes stay inside cells")
+
+    header, body = parse_markdown_table(
+        "| a | b |\n|---|---|\n| \\`x | y |\n"
+    )
+    assert header == ["a", "b"], f"FAIL parse escaped-backtick header: {header!r}"
+    assert body == [["`x", "y"]], (
+        f"FAIL parse escaped-backtick body: {body!r}"
+    )
+    print("OK  parse-escape: escaped backtick does not hide column pipe")
+
+    header, body = parse_markdown_table(
+        "| a | b |\n|---|---|\n| ``x | y`` | z |\n"
+    )
+    assert header == ["a", "b"], f"FAIL parse multi-code header: {header!r}"
+    assert body == [["``x | y``", "z"]], (
+        f"FAIL parse multi-code body: {body!r}"
+    )
+    print("OK  parse-code:   multi-backtick code span keeps pipe inside cell")
+
 
 def test_split_text_around_tables():
     segments = split_text_around_tables(
@@ -389,6 +418,45 @@ def test_build_table_html_smoke():
     assert "&amp;" in html2, "FAIL build_table_html: ampersand not escaped"
     assert "&lt;b&gt;" in html2, "FAIL build_table_html: angle brackets not escaped"
     print("OK  build_html:   table HTML + escaping OK")
+
+
+def test_render_inline_markdown_in_table_cells():
+    """Safe inline Markdown renders as HTML while raw HTML remains escaped."""
+    html = build_table_html(
+        ["feature"],
+        [["**bold** *em* `code` ~~gone~~ [site](https://example.com)"]],
+    )
+    assert "<strong>bold</strong>" in html, "FAIL inline-md: bold not rendered"
+    assert "**bold**" not in html, "FAIL inline-md: raw bold markers leaked"
+    assert "<em>em</em>" in html, "FAIL inline-md: italic not rendered"
+    assert "<code>code</code>" in html, "FAIL inline-md: code not rendered"
+    assert "<del>gone</del>" in html, "FAIL inline-md: strike not rendered"
+    assert '<a href="https://example.com"' in html, "FAIL inline-md: link not rendered"
+
+    unsafe = build_table_html(["x"], [["<b>raw</b> [x](javascript:alert(1))"]])
+    assert "&lt;b&gt;raw&lt;/b&gt;" in unsafe, "FAIL inline-md: raw HTML not escaped"
+    assert "javascript:alert" not in unsafe, "FAIL inline-md: unsafe href leaked"
+    assert '<a href="javascript:' not in unsafe, "FAIL inline-md: unsafe link rendered"
+    print("OK  inline-md:    safe subset rendered; raw HTML/unsafe links escaped")
+
+    direct = render_inline_markdown("**ok** and <script>x</script>")
+    assert "<strong>ok</strong>" in direct and "&lt;script&gt;" in direct
+
+    assert render_inline_markdown("3 * 4 * 5") == "3 * 4 * 5", (
+        "FAIL inline-md: spaced multiplication was treated as emphasis"
+    )
+    assert render_inline_markdown("3*4*5") == "3*4*5", (
+        "FAIL inline-md: compact multiplication was treated as emphasis"
+    )
+    assert render_inline_markdown("this_is_var") == "this_is_var", (
+        "FAIL inline-md: snake_case identifier was treated as emphasis"
+    )
+
+    multi_code = render_inline_markdown("``x | y``")
+    assert "<code>x | y</code>" in multi_code, (
+        f"FAIL inline-md: multi-backtick code not rendered: {multi_code!r}"
+    )
+    assert "``x | y``" not in multi_code, "FAIL inline-md: raw multi-code leaked"
 
 
 def test_build_table_html_github_style():
@@ -433,6 +501,30 @@ def test_build_table_html_github_style():
             f"FAIL github-style: old style {needle!r} still present"
         )
     print("OK  github-style: required fragments present, old style purged")
+
+
+def test_screenshot_viewport_uses_measured_content_size():
+    """Viewport selection should grow to full table dimensions."""
+    viewport = _calculate_screenshot_viewport(
+        {
+            "targetWidth": 2600,
+            "targetHeight": 12000,
+            "targetRight": 2612,
+            "targetBottom": 12012,
+            "documentWidth": 2624,
+            "documentHeight": 12024,
+            "bodyWidth": 2624,
+            "bodyHeight": 12024,
+        },
+        min_width=1400,
+    )
+    assert viewport["width"] == 2624, f"FAIL viewport width: {viewport!r}"
+    assert viewport["height"] == 12024, f"FAIL viewport height: {viewport!r}"
+
+    viewport = _calculate_screenshot_viewport({"targetWidth": 800, "targetHeight": 50}, 1400)
+    assert viewport["width"] == 1400, f"FAIL viewport min-width: {viewport!r}"
+    assert viewport["height"] >= 50, f"FAIL viewport height small: {viewport!r}"
+    print("OK  viewport:     measured dimensions drive screenshot viewport")
 
 
 # ---------------------------------------------------------------------------
@@ -579,7 +671,9 @@ def main():
     test_table_parse()
     test_split_text_around_tables()
     test_build_table_html_smoke()
+    test_render_inline_markdown_in_table_cells()
     test_build_table_html_github_style()
+    test_screenshot_viewport_uses_measured_content_size()
     test_table_after_paragraph()
     print("=" * 70)
     print("ALL TESTS PASSED")
