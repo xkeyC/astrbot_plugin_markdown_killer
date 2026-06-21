@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import html
 import re
+from urllib.parse import urlparse
 
 from astrbot.api import logger
 
@@ -25,6 +26,38 @@ def detect_markdown_tables(text: str) -> list[tuple[int, int, str]]:
     return [(m.start(), m.end(), m.group(0)) for m in _TABLE_RE.finditer(text)]
 
 
+def _is_escaped(text: str, index: int) -> bool:
+    """Return whether ``text[index]`` is escaped by an odd backslash run."""
+    slash_count = 0
+    i = index - 1
+    while i >= 0 and text[i] == "\\":
+        slash_count += 1
+        i -= 1
+    return slash_count % 2 == 1
+
+
+def _count_backtick_run(text: str, index: int) -> int:
+    """Count consecutive backticks starting at ``index``."""
+    i = index
+    while i < len(text) and text[i] == "`":
+        i += 1
+    return i - index
+
+
+def _find_closing_backtick_run(text: str, start: int, run_length: int) -> int:
+    """Find an unescaped, exact-length closing backtick run, or ``-1``."""
+    i = start
+    while i < len(text):
+        if text[i] != "`":
+            i += 1
+            continue
+        found_length = _count_backtick_run(text, i)
+        if found_length == run_length and not _is_escaped(text, i):
+            return i
+        i += found_length
+    return -1
+
+
 def parse_markdown_table(table_text: str) -> tuple[list[str], list[list[str]]]:
     """Parse a markdown table block into ``(header_cells, body_rows)``.
 
@@ -41,7 +74,45 @@ def parse_markdown_table(table_text: str) -> tuple[list[str], list[list[str]]]:
             s = s[1:]
         if s.endswith("|"):
             s = s[:-1]
-        cells = re.split(r"\s*\|\s*", s)
+        cells: list[str] = []
+        current: list[str] = []
+        code_delimiter_len: int | None = None
+        i = 0
+        while i < len(s):
+            ch = s[i]
+            if ch == "\\" and code_delimiter_len is None and i + 1 < len(s):
+                # Markdown tables use escaped pipes for literal pipe text inside
+                # cells. Escaped backticks must also be consumed here so they do
+                # not incorrectly open/close a code span and hide later column
+                # delimiters.
+                if s[i + 1] == "|":
+                    current.append("|")
+                elif s[i + 1] == "`":
+                    current.append("`")
+                else:
+                    current.append(ch)
+                    current.append(s[i + 1])
+                i += 2
+                continue
+            if ch == "`":
+                run_length = _count_backtick_run(s, i)
+                run_end = i + run_length
+                if code_delimiter_len is None:
+                    if _find_closing_backtick_run(s, run_end, run_length) != -1:
+                        code_delimiter_len = run_length
+                elif run_length == code_delimiter_len and not _is_escaped(s, i):
+                    code_delimiter_len = None
+                current.append(s[i:run_end])
+                i = run_end
+                continue
+            if ch == "|" and code_delimiter_len is None:
+                cells.append("".join(current).strip())
+                current = []
+                i += 1
+                continue
+            current.append(ch)
+            i += 1
+        cells.append("".join(current).strip())
         return [c.strip() for c in cells]
 
     header = parse_row(lines[0])
@@ -50,15 +121,114 @@ def parse_markdown_table(table_text: str) -> tuple[list[str], list[list[str]]]:
     return (header, body)
 
 
+_PLACEHOLDER_RE = re.compile(r"\ue000MDK\d+\ue001")
+_LINK_RE = re.compile(r"\[([^\]\n]+)\]\(((?:[^()\s]|\([^()\s]*\))+?)\)")
+_SAFE_LINK_SCHEMES = {"http", "https", "mailto"}
+
+
+def _is_safe_link(url: str) -> bool:
+    """Return whether ``url`` is safe to place in an HTML ``href``."""
+    parsed = urlparse(url.strip())
+    return parsed.scheme.lower() in _SAFE_LINK_SCHEMES and bool(parsed.netloc or parsed.path)
+
+
+def _render_emphasis_only(text: str) -> str:
+    """Render emphasis markers in already-tokenized inline text safely.
+
+    This helper first HTML-escapes user content, then converts a small safe
+    subset of inline Markdown. Placeholder tokens created by
+    ``render_inline_markdown`` do not contain marker characters and therefore
+    pass through unchanged until the final restore step.
+    """
+    rendered = html.escape(text, quote=False)
+    rendered = re.sub(r"~~(?!\s)(.+?)(?<!\s)~~", r"<del>\1</del>", rendered)
+    rendered = re.sub(
+        r"(?<![\w*])\*\*(?!\s)(.+?)(?<!\s)\*\*(?![\w*])",
+        r"<strong>\1</strong>",
+        rendered,
+    )
+    rendered = re.sub(
+        r"(?<![\w_])__(?!\s)(.+?)(?<!\s)__(?![\w_])",
+        r"<strong>\1</strong>",
+        rendered,
+    )
+    rendered = re.sub(
+        r"(?<![\w*])\*(?![\s*])(.+?)(?<!\s)\*(?![\w*])",
+        r"<em>\1</em>",
+        rendered,
+    )
+    rendered = re.sub(
+        r"(?<![\w_])_(?![\s_])(.+?)(?<!\s)_(?![\w_])",
+        r"<em>\1</em>",
+        rendered,
+    )
+    return rendered
+
+
+def _replace_code_spans(text: str, reserve) -> str:
+    """Replace single- or multi-backtick code spans with reserved HTML tokens."""
+    out: list[str] = []
+    i = 0
+    while i < len(text):
+        if text[i] == "`" and not _is_escaped(text, i):
+            run_length = _count_backtick_run(text, i)
+            content_start = i + run_length
+            close = _find_closing_backtick_run(text, content_start, run_length)
+            if close != -1:
+                code_text = text[content_start:close]
+                out.append(reserve(f"<code>{html.escape(code_text, quote=False)}</code>"))
+                i = close + run_length
+                continue
+        out.append(text[i])
+        i += 1
+    return "".join(out)
+
+
+def render_inline_markdown(text: str) -> str:
+    """Render a deliberately small, safe subset of inline Markdown.
+
+    Supported syntax: ``**bold**``, ``*italic*``, ``~~strike~~``, inline
+    ``code``, and safe ``[links](https://...)``. Raw HTML is always escaped
+    before marker conversion, and links are emitted only for http/https/mailto
+    URLs. This function is intentionally independent of table row splitting;
+    callers should parse table cells first, then render cell contents.
+    """
+    placeholders: dict[str, str] = {}
+
+    def reserve(rendered_html: str) -> str:
+        token = f"\ue000MDK{len(placeholders)}\ue001"
+        placeholders[token] = rendered_html
+        return token
+
+    tokenized = _replace_code_spans(text, reserve)
+
+    def replace_link(match: re.Match[str]) -> str:
+        label = _render_emphasis_only(match.group(1))
+        url = match.group(2).strip()
+        if not _is_safe_link(url):
+            return reserve(label)
+        safe_href = html.escape(url, quote=True)
+        return reserve(f'<a href="{safe_href}" rel="noreferrer noopener">{label}</a>')
+
+    tokenized = _LINK_RE.sub(replace_link, tokenized)
+    rendered = _render_emphasis_only(tokenized)
+
+    # Restore placeholders repeatedly so a link label that contained an inline
+    # code placeholder is restored inside the link HTML as well.
+    previous = None
+    while previous != rendered and _PLACEHOLDER_RE.search(rendered):
+        previous = rendered
+        for token, replacement in placeholders.items():
+            rendered = rendered.replace(token, replacement)
+    return rendered
+
+
 def build_table_html(header_cells: list[str], body_rows: list[list[str]]) -> str:
     """Build a complete standalone HTML document with the table styled as a card."""
 
-    def esc(s: str) -> str:
-        return html.escape(s, quote=False)
-
-    header_html = "".join(f"<th>{esc(c)}</th>" for c in header_cells)
+    header_html = "".join(f"<th>{render_inline_markdown(c)}</th>" for c in header_cells)
     body_html = "".join(
-        f"<tr>{''.join(f'<td>{esc(c)}</td>' for c in row)}</tr>"
+        f"<tr>{''.join(f'<td>{render_inline_markdown(c)}</td>' for c in row)}</tr>"
         for row in body_rows
     )
 
@@ -67,10 +237,6 @@ def build_table_html(header_cells: list[str], body_rows: list[list[str]]) -> str
         f"<tbody>{body_html}</tbody></table>"
     )
 
-    # NOTE: cells are escaped with html.escape(quote=False) only; we do NOT
-    # convert markdown `` `code` `` syntax inside cells to <code> tags. The
-    # ``code`` CSS rule below is forward-compat: if a future commit adds
-    # inline-code parsing, the styling will already match GitHub's look.
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>

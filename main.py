@@ -59,7 +59,7 @@ def _is_list_context_line(
     "astrbot_plugin_markdown_killer",
     "xkeyC",
     "移除输出中的Markdown格式（保留列表标记换行、支持表格图片渲染）",
-    "0.2.5",
+    "0.2.6",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):
