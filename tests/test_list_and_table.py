@@ -9,6 +9,7 @@ file is importable from any environment without an AstrBot runtime.
 Run: ``python tests/test_list_and_table.py``
 """
 
+import asyncio
 import logging
 import os
 import re
@@ -218,9 +219,12 @@ def _load_plugin_class_for_tests():
             self.text = text
 
     class _Image:
+        def __init__(self, data=None):
+            self.data = data
+
         @classmethod
-        def fromBytes(cls, _data):
-            return cls()
+        def fromBytes(cls, data):
+            return cls(data)
 
     _astrbot_api_pkg.message_components = types.SimpleNamespace(
         Plain=_Plain,
@@ -659,6 +663,177 @@ def test_table_after_paragraph():
     print(f"OK  buggy-user:    reproduces glue (silent failure) -> {buggy_user[:60]!r}...")
 
 
+def test_rendered_table_images_have_block_boundaries():
+    """Rendered tables are separated from text without edge-only padding."""
+    plugin = _new_plugin_for_tests()
+    plugin.table_render_fallback = "text"
+    plugin._table_render_failure_logged = False
+
+    renderer_globals = plugin._render_tables_in_chain.__func__.__globals__
+    original_renderer = renderer_globals["render_table_to_image_bytes"]
+
+    async def fake_renderer(table_text, timeout=20000):
+        return table_text.encode()
+
+    renderer_globals["render_table_to_image_bytes"] = fake_renderer
+
+    class _Result:
+        def __init__(self, chain):
+            self.chain = chain
+            self.disable_segment_reply = False
+
+    components = renderer_globals["Comp"]
+    Plain = components.Plain
+    Image = components.Image
+    table = "| a | b |\n|---|---|\n| 1 | 2 |\n"
+
+    try:
+        surrounded = _Result([Plain(f"before\n{table}after")])
+        asyncio.run(plugin._render_tables_in_chain(surrounded))
+        assert len(surrounded.chain) == 3, surrounded.chain
+        assert isinstance(surrounded.chain[0], Plain)
+        assert surrounded.chain[0].text == "before\n"
+        assert isinstance(surrounded.chain[1], Image)
+        assert isinstance(surrounded.chain[2], Plain)
+        assert surrounded.chain[2].text == "\nafter"
+        assert surrounded.disable_segment_reply is True
+
+        at_start = _Result([Plain(f"{table}after")])
+        asyncio.run(plugin._render_tables_in_chain(at_start))
+        assert isinstance(at_start.chain[0], Image)
+        assert at_start.chain[1].text == "\nafter"
+
+        at_end = _Result([Plain(f"before\n{table}")])
+        asyncio.run(plugin._render_tables_in_chain(at_end))
+        assert at_end.chain[0].text == "before\n"
+        assert isinstance(at_end.chain[1], Image)
+        assert len(at_end.chain) == 2
+
+        two_tables = _Result([Plain(f"{table}\n{table}")])
+        asyncio.run(plugin._render_tables_in_chain(two_tables))
+        assert len(two_tables.chain) == 3, two_tables.chain
+        assert isinstance(two_tables.chain[0], Image)
+        assert isinstance(two_tables.chain[1], Plain)
+        assert two_tables.chain[1].text == "\n"
+        assert isinstance(two_tables.chain[2], Image)
+        # Simulate global Markdown cleanup trimming the separator, then verify
+        # the post-cleanup spacing pass restores it.
+        two_tables.chain[1].text = ""
+        image_ids = {
+            id(two_tables.chain[0]),
+            id(two_tables.chain[2]),
+        }
+        two_tables.chain = plugin._separate_rendered_table_images(
+            two_tables.chain, image_ids
+        )
+        assert two_tables.chain[1].text == "\n"
+
+        rendered = Image(b"table")
+        empty_before = Plain("")
+        before_with_empty = [Plain("before"), empty_before, rendered]
+        separated = plugin._separate_rendered_table_images(
+            before_with_empty, {id(rendered)}
+        )
+        assert separated == before_with_empty
+        assert separated[0].text == "before"
+        assert separated[1].text == "\n"
+
+        rendered = Image(b"table")
+        empty_after = Plain("")
+        after_with_empty = [rendered, empty_after, Plain("after")]
+        separated = plugin._separate_rendered_table_images(
+            after_with_empty, {id(rendered)}
+        )
+        assert separated == after_with_empty
+        assert separated[1].text == "\n"
+        assert separated[2].text == "after"
+
+        untouched_plain = Plain("plain **markdown** text")
+        no_table = _Result([untouched_plain])
+        asyncio.run(plugin._render_tables_in_chain(no_table))
+        assert no_table.chain == [untouched_plain]
+        assert untouched_plain.text == "plain **markdown** text"
+
+        ordinary_image = Image(b"ordinary")
+        ordinary_chain = [Plain("before"), ordinary_image, Plain("after")]
+        separated = plugin._separate_rendered_table_images(ordinary_chain, set())
+        assert separated == ordinary_chain
+        assert separated[0].text == "before"
+        assert separated[2].text == "after"
+    finally:
+        renderer_globals["render_table_to_image_bytes"] = original_renderer
+
+    print("OK  image-spacing: text/table edges and consecutive tables separated")
+
+
+def test_global_cleanup_restores_boundaries_across_empty_plain():
+    """Full decorating flow repairs marker-only Plain components after cleanup."""
+    plugin = _new_plugin_for_tests()
+    plugin.config = {"enable_global_markdown_killer": True}
+    plugin.enable_table_render = True
+    plugin._playwright_available = True
+    plugin.table_render_fallback = "text"
+    plugin._table_render_failure_logged = False
+
+    renderer_globals = plugin._render_tables_in_chain.__func__.__globals__
+    original_renderer = renderer_globals["render_table_to_image_bytes"]
+
+    async def fake_renderer(table_text, timeout=20000):
+        return table_text.encode()
+
+    renderer_globals["render_table_to_image_bytes"] = fake_renderer
+    components = renderer_globals["Comp"]
+    Plain = components.Plain
+    Image = components.Image
+    table = "| a | b |\n|---|---|\n| 1 | 2 |\n"
+
+    class _Result:
+        result_content_type = None
+
+        def __init__(self, chain):
+            self.chain = chain
+            self.disable_segment_reply = False
+
+    class _Event:
+        def __init__(self, result):
+            self.result = result
+
+        def get_result(self):
+            return self.result
+
+    try:
+        result = _Result(
+            [
+                Plain("before"),
+                Plain("**"),
+                Plain(table),
+                Plain("**"),
+                Plain("after"),
+            ]
+        )
+        asyncio.run(plugin.on_decorating_result(_Event(result)))
+
+        assert len(result.chain) == 5, result.chain
+        assert result.chain[0].text == "before"
+        assert result.chain[1].text == "\n"
+        assert isinstance(result.chain[2], Image)
+        assert result.chain[3].text == "\n"
+        assert result.chain[4].text == "after"
+
+        first_pass = list(result.chain)
+        rendered_ids = {id(result.chain[2])}
+        result.chain = plugin._separate_rendered_table_images(
+            result.chain, rendered_ids
+        )
+        assert result.chain == first_pass
+        assert result.chain[1].text == "\n"
+        assert result.chain[3].text == "\n"
+    finally:
+        renderer_globals["render_table_to_image_bytes"] = original_renderer
+
+    print("OK  global-spacing: cleanup-empty Plain boundaries restored idempotently")
+
+
 def main():
     print("=" * 70)
     print("test_list_and_table.py - real-implementation verification")
@@ -675,6 +850,8 @@ def main():
     test_build_table_html_github_style()
     test_screenshot_viewport_uses_measured_content_size()
     test_table_after_paragraph()
+    test_rendered_table_images_have_block_boundaries()
+    test_global_cleanup_restores_boundaries_across_empty_plain()
     print("=" * 70)
     print("ALL TESTS PASSED")
     print("=" * 70)

@@ -173,8 +173,9 @@ class MarkdownKillerPlugin(Star):
             return
 
         # Phase 1: extract tables and render to images.
+        rendered_image_ids: set[int] = set()
         if self.enable_table_render and self._playwright_available:
-            await self._render_tables_in_chain(result)
+            rendered_image_ids = await self._render_tables_in_chain(result)
 
         # Phase 2: global markdown removal (only when enabled).
         if self._config_get("enable_global_markdown_killer", False):
@@ -187,7 +188,13 @@ class MarkdownKillerPlugin(Star):
                     comp.text = cleaned_text
                     self._log_cleaned_text(text, cleaned_text, source="[全局过滤]")
 
-    async def _render_tables_in_chain(self, result) -> None:
+        # Global cleanup can trim the boundary newlines added in phase 1.
+        if rendered_image_ids:
+            result.chain = self._separate_rendered_table_images(
+                result.chain, rendered_image_ids
+            )
+
+    async def _render_tables_in_chain(self, result) -> set[int]:
         """Scan the chain for Plain components containing markdown tables; render as images.
 
         Tables within the SAME message are rendered concurrently via
@@ -214,7 +221,7 @@ class MarkdownKillerPlugin(Star):
                         jobs.append((comp_index, seg_index, seg["text"]))
 
         if not jobs:
-            return
+            return set()
 
         # Render all tables in parallel; exceptions become None (fallback path).
         render_tasks = [
@@ -231,6 +238,7 @@ class MarkdownKillerPlugin(Star):
 
         # Reconstruct the chain using rendered images / fallbacks (order preserved).
         new_chain = []
+        rendered_image_ids: set[int] = set()
         for comp_index, comp in enumerate(result.chain):
             text = getattr(comp, "text", None)
             if not (
@@ -249,7 +257,9 @@ class MarkdownKillerPlugin(Star):
                 elif seg["type"] == "table":
                     image_bytes = results.get((comp_index, seg_index))
                     if image_bytes:
-                        new_chain.append(Comp.Image.fromBytes(image_bytes))
+                        image = Comp.Image.fromBytes(image_bytes)
+                        new_chain.append(image)
+                        rendered_image_ids.add(id(image))
                         logger.debug("[MarkdownKiller] 表格已渲染为图片")
                     else:
                         fallback = self._apply_table_fallback(seg["text"])
@@ -264,7 +274,13 @@ class MarkdownKillerPlugin(Star):
                             self._table_render_failure_logged = True
                         else:
                             logger.debug(fallback_msg)
-        result.chain = new_chain
+        # Image components are inline in AstrBot's message chain. Preserve a
+        # block boundary around rendered tables so adjacent text (or another
+        # rendered table) is not visually glued to the image. Do not add
+        # leading/trailing whitespace for a table at the message boundary.
+        result.chain = self._separate_rendered_table_images(
+            new_chain, rendered_image_ids
+        )
 
         # Set disable_segment_reply so RespondStage sends the entire chain
         # (text + table images + text) as ONE message instead of splitting
@@ -278,6 +294,64 @@ class MarkdownKillerPlugin(Star):
         logger.info(
             f"[MarkdownKiller] 渲染 {len(jobs)} 个表格，耗时 {elapsed:.2f}s"
         )
+        return rendered_image_ids
+
+    @staticmethod
+    def _separate_rendered_table_images(chain, rendered_image_ids: set[int]):
+        """Add idempotent boundaries around only table images rendered here."""
+        separated_chain = list(chain)
+        image_index = 0
+        while image_index < len(separated_chain):
+            image = separated_chain[image_index]
+            if id(image) not in rendered_image_ids:
+                image_index += 1
+                continue
+
+            # Markdown cleanup can turn marker-only Plain components into empty
+            # placeholders. Look through them for real content, then put the
+            # boundary in the placeholder closest to the table image.
+            previous_index = image_index - 1
+            while (
+                previous_index >= 0
+                and isinstance(separated_chain[previous_index], Comp.Plain)
+                and not separated_chain[previous_index].text
+            ):
+                previous_index -= 1
+
+            if previous_index >= 0:
+                if previous_index < image_index - 1:
+                    separated_chain[image_index - 1].text = "\n"
+                else:
+                    previous = separated_chain[previous_index]
+                    if isinstance(previous, Comp.Plain):
+                        if previous.text and not previous.text.endswith("\n"):
+                            previous.text += "\n"
+                    else:
+                        separated_chain.insert(image_index, Comp.Plain("\n"))
+                        image_index += 1
+
+            next_index = image_index + 1
+            while (
+                next_index < len(separated_chain)
+                and isinstance(separated_chain[next_index], Comp.Plain)
+                and not separated_chain[next_index].text
+            ):
+                next_index += 1
+
+            if next_index < len(separated_chain):
+                if next_index > image_index + 1:
+                    separated_chain[image_index + 1].text = "\n"
+                else:
+                    following = separated_chain[next_index]
+                    if isinstance(following, Comp.Plain):
+                        if following.text and not following.text.startswith("\n"):
+                            following.text = "\n" + following.text
+                    else:
+                        separated_chain.insert(image_index + 1, Comp.Plain("\n"))
+
+            image_index += 1
+
+        return separated_chain
 
     def _apply_table_fallback(self, table_md: str) -> str | None:
         """Return fallback text for a table block according to table_render_fallback config."""
