@@ -1,4 +1,4 @@
-"""Singleton Playwright browser management for table rendering.
+"""Singleton Playwright browser management for table/formula rendering.
 
 The module is import-safe even when ``playwright`` is not installed: the
 ``playwright`` imports are deferred to call time so that the plugin can still

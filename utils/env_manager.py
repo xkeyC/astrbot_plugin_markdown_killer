@@ -1,4 +1,4 @@
-"""Playwright/Chromium environment manager.
+"""Playwright/Chromium environment manager for image rendering.
 
 Auto-installs Chromium on first run via ``python -m playwright install chromium``
 and tracks completion via a ``.playwright_installed`` flag file in the plugin

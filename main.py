@@ -9,9 +9,12 @@ try:
     from .utils import (
         EnvManager,
         close_browser,
+        contains_latex_formulas,
         detect_markdown_tables,
         parse_markdown_table,
+        render_formula_to_image_bytes,
         render_table_to_image_bytes,
+        split_text_around_formulas,
         split_text_around_tables,
     )
     from .utils.list_processor import remove_list_markers as _remove_list_markers_impl
@@ -19,9 +22,12 @@ except ImportError:  # pragma: no cover - fallback when loaded as top-level modu
     from utils import (  # type: ignore
         EnvManager,
         close_browser,
+        contains_latex_formulas,
         detect_markdown_tables,
         parse_markdown_table,
+        render_formula_to_image_bytes,
         render_table_to_image_bytes,
+        split_text_around_formulas,
         split_text_around_tables,
     )
     from utils.list_processor import (  # type: ignore
@@ -58,8 +64,8 @@ def _is_list_context_line(
 @register(
     "astrbot_plugin_markdown_killer",
     "xkeyC",
-    "移除输出中的Markdown格式（保留列表标记换行、支持表格图片渲染）",
-    "0.2.6",
+    "移除输出中的Markdown格式（保留列表标记换行、支持表格与公式图片渲染）",
+    "0.3.0",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):
@@ -73,11 +79,16 @@ class MarkdownKillerPlugin(Star):
         )
         self.enable_table_render = self._config_get("enable_table_render", True)
         self.table_render_fallback = self._config_get("table_render_fallback", "text")
+        self.enable_formula_render = self._config_get("enable_formula_render", True)
+        self.formula_render_fallback = self._config_get(
+            "formula_render_fallback", "raw"
+        )
 
         # N4: suppress repeated warnings for table-render failures — log the
         # first occurrence at warning level and downgrade subsequent ones to
         # debug, since the same root cause typically affects every render.
         self._table_render_failure_logged: bool = False
+        self._formula_render_failure_logged: bool = False
 
         # Detect Playwright availability up-front; re-checked in initialize().
         self._playwright_available = False
@@ -87,14 +98,14 @@ class MarkdownKillerPlugin(Star):
             self._playwright_available = True
         except ImportError:
             logger.warning(
-                "[MarkdownKiller] 未安装 playwright，表格渲染功能将被禁用。"
+                "[MarkdownKiller] 未安装 playwright，表格与公式渲染功能将被禁用。"
             )
 
         self._env_manager: EnvManager | None = None
 
     async def initialize(self) -> None:
         """Called when the plugin is activated. Sets up Playwright env if enabled."""
-        if not self.enable_table_render:
+        if not self.enable_table_render and not self.enable_formula_render:
             return
         try:
             data_dir = str(StarTools.get_data_dir("astrbot_plugin_markdown_killer"))
@@ -102,7 +113,7 @@ class MarkdownKillerPlugin(Star):
 
             if not self._env_manager.is_installed():
                 logger.info(
-                    "[MarkdownKiller] 首次启用表格渲染，正在准备 Playwright Chromium..."
+                    "[MarkdownKiller] 首次启用图片渲染，正在准备 Playwright Chromium..."
                 )
                 await self._env_manager.install_dependencies()
 
@@ -114,12 +125,14 @@ class MarkdownKillerPlugin(Star):
 
             if not self._playwright_available:
                 logger.warning(
-                    "[MarkdownKiller] Playwright 不可用，已自动关闭表格渲染。"
+                    "[MarkdownKiller] Playwright 不可用，已自动关闭表格与公式渲染。"
                 )
                 self.enable_table_render = False
+                self.enable_formula_render = False
         except Exception as e:
             logger.error(f"[MarkdownKiller] 初始化 Playwright 失败: {e}")
             self.enable_table_render = False
+            self.enable_formula_render = False
             self._playwright_available = False
 
     async def terminate(self) -> None:
@@ -172,10 +185,12 @@ class MarkdownKillerPlugin(Star):
         if result.result_content_type == ResultContentType.STREAMING_FINISH:
             return
 
-        # Phase 1: extract tables and render to images.
+        # Phase 1: extract tables/formulas and render them to images.
         rendered_image_ids: set[int] = set()
         if self.enable_table_render and self._playwright_available:
-            rendered_image_ids = await self._render_tables_in_chain(result)
+            rendered_image_ids.update(await self._render_tables_in_chain(result))
+        if self.enable_formula_render and self._playwright_available:
+            rendered_image_ids.update(await self._render_formulas_in_chain(result))
 
         # Phase 2: global markdown removal (only when enabled).
         if self._config_get("enable_global_markdown_killer", False):
@@ -190,7 +205,7 @@ class MarkdownKillerPlugin(Star):
 
         # Global cleanup can trim the boundary newlines added in phase 1.
         if rendered_image_ids:
-            result.chain = self._separate_rendered_table_images(
+            result.chain = self._separate_rendered_images(
                 result.chain, rendered_image_ids
             )
 
@@ -278,9 +293,7 @@ class MarkdownKillerPlugin(Star):
         # block boundary around rendered tables so adjacent text (or another
         # rendered table) is not visually glued to the image. Do not add
         # leading/trailing whitespace for a table at the message boundary.
-        result.chain = self._separate_rendered_table_images(
-            new_chain, rendered_image_ids
-        )
+        result.chain = self._separate_rendered_images(new_chain, rendered_image_ids)
 
         # Set disable_segment_reply so RespondStage sends the entire chain
         # (text + table images + text) as ONE message instead of splitting
@@ -291,14 +304,129 @@ class MarkdownKillerPlugin(Star):
             result.disable_segment_reply = True
 
         elapsed = time.perf_counter() - start_ts
+        logger.info(f"[MarkdownKiller] 渲染 {len(jobs)} 个表格，耗时 {elapsed:.2f}s")
+        return rendered_image_ids
+
+    def _split_formula_blocks(self, text: str) -> list[dict]:
+        """Split formulas while leaving any failed/raw Markdown table intact."""
+        segments: list[dict] = []
+        for table_segment in split_text_around_tables(text):
+            if table_segment["type"] == "table":
+                segments.append({"type": "text", "text": table_segment["text"]})
+            else:
+                segments.extend(split_text_around_formulas(table_segment["text"]))
+        return segments
+
+    async def _render_formulas_in_chain(self, result) -> set[int]:
+        """Render block formulas and inline-formula lines, preserving chain order."""
+        start_ts = time.perf_counter()
+        jobs: list[tuple[int, int, str, bool]] = []
+        component_segments: dict[int, list[dict]] = {}
+
+        for comp_index, comp in enumerate(result.chain):
+            text = getattr(comp, "text", None)
+            if not (
+                isinstance(comp, Comp.Plain)
+                and isinstance(text, str)
+                and contains_latex_formulas(text)
+            ):
+                continue
+            segments = self._split_formula_blocks(text)
+            component_segments[comp_index] = segments
+            for seg_index, segment in enumerate(segments):
+                if segment["type"] == "formula":
+                    jobs.append(
+                        (
+                            comp_index,
+                            seg_index,
+                            segment["text"],
+                            bool(segment["display"]),
+                        )
+                    )
+
+        if not jobs:
+            return set()
+
+        gathered = await asyncio.gather(
+            *[
+                render_formula_to_image_bytes(source, display, timeout=20000)
+                for _, _, source, display in jobs
+            ],
+            return_exceptions=True,
+        )
+        results: dict[tuple[int, int], bytes | None] = {}
+        for (comp_index, seg_index, _, _), outcome in zip(jobs, gathered):
+            results[(comp_index, seg_index)] = (
+                None if isinstance(outcome, Exception) else outcome
+            )
+
+        new_chain = []
+        rendered_image_ids: set[int] = set()
+        for comp_index, comp in enumerate(result.chain):
+            segments = component_segments.get(comp_index)
+            if segments is None:
+                new_chain.append(comp)
+                continue
+            for seg_index, segment in enumerate(segments):
+                if segment["type"] == "text":
+                    if segment["text"]:
+                        new_chain.append(Comp.Plain(segment["text"]))
+                    continue
+
+                image_bytes = results.get((comp_index, seg_index))
+                if image_bytes:
+                    image = Comp.Image.fromBytes(image_bytes)
+                    new_chain.append(image)
+                    rendered_image_ids.add(id(image))
+                    logger.debug("[MarkdownKiller] 公式已渲染为图片")
+                    continue
+
+                fallback = self._apply_formula_fallback(segment)
+                if fallback is not None:
+                    new_chain.append(Comp.Plain(fallback))
+                fallback_msg = (
+                    "[MarkdownKiller] 公式渲染失败，已按 "
+                    f"{self.formula_render_fallback} 策略回退"
+                )
+                if not self._formula_render_failure_logged:
+                    logger.warning(fallback_msg)
+                    self._formula_render_failure_logged = True
+                else:
+                    logger.debug(fallback_msg)
+
+        result.chain = self._separate_rendered_images(new_chain, rendered_image_ids)
+        if rendered_image_ids:
+            result.disable_segment_reply = True
+
+        elapsed = time.perf_counter() - start_ts
         logger.info(
-            f"[MarkdownKiller] 渲染 {len(jobs)} 个表格，耗时 {elapsed:.2f}s"
+            f"[MarkdownKiller] 渲染 {len(jobs)} 个公式片段，耗时 {elapsed:.2f}s"
         )
         return rendered_image_ids
 
+    def _apply_formula_fallback(self, segment: dict) -> str | None:
+        mode = self.formula_render_fallback
+        if mode == "remove":
+            return None
+        if mode == "text":
+            return segment["text"]
+        return segment.get("raw", segment["text"])
+
     @staticmethod
-    def _separate_rendered_table_images(chain, rendered_image_ids: set[int]):
-        """Add idempotent boundaries around only table images rendered here."""
+    def _separate_rendered_images(chain, rendered_image_ids: set[int]):
+        """Add stable blank-line boundaries around images rendered here.
+
+        A standalone newline-only Plain component may be discarded by message
+        adapters. The zero-width-space marker keeps an image-to-image boundary
+        non-empty while the surrounding newlines provide actual visual space.
+        """
+        boundary_marker = "\n\u200b\n"
+
+        def is_boundary_placeholder(component) -> bool:
+            return isinstance(component, Comp.Plain) and (
+                not component.text or component.text.strip(" \t\r\n") == "\u200b"
+            )
+
         separated_chain = list(chain)
         image_index = 0
         while image_index < len(separated_chain):
@@ -311,47 +439,50 @@ class MarkdownKillerPlugin(Star):
             # placeholders. Look through them for real content, then put the
             # boundary in the placeholder closest to the table image.
             previous_index = image_index - 1
-            while (
-                previous_index >= 0
-                and isinstance(separated_chain[previous_index], Comp.Plain)
-                and not separated_chain[previous_index].text
+            while previous_index >= 0 and is_boundary_placeholder(
+                separated_chain[previous_index]
             ):
                 previous_index -= 1
 
             if previous_index >= 0:
                 if previous_index < image_index - 1:
-                    separated_chain[image_index - 1].text = "\n"
+                    separated_chain[image_index - 1].text = boundary_marker
                 else:
                     previous = separated_chain[previous_index]
                     if isinstance(previous, Comp.Plain):
-                        if previous.text and not previous.text.endswith("\n"):
-                            previous.text += "\n"
+                        if previous.text:
+                            previous.text = previous.text.rstrip("\n") + "\n\n"
                     else:
-                        separated_chain.insert(image_index, Comp.Plain("\n"))
+                        separated_chain.insert(image_index, Comp.Plain(boundary_marker))
                         image_index += 1
 
             next_index = image_index + 1
-            while (
-                next_index < len(separated_chain)
-                and isinstance(separated_chain[next_index], Comp.Plain)
-                and not separated_chain[next_index].text
+            while next_index < len(separated_chain) and is_boundary_placeholder(
+                separated_chain[next_index]
             ):
                 next_index += 1
 
             if next_index < len(separated_chain):
                 if next_index > image_index + 1:
-                    separated_chain[image_index + 1].text = "\n"
+                    separated_chain[image_index + 1].text = boundary_marker
                 else:
                     following = separated_chain[next_index]
                     if isinstance(following, Comp.Plain):
-                        if following.text and not following.text.startswith("\n"):
-                            following.text = "\n" + following.text
+                        if following.text:
+                            following.text = "\n\n" + following.text.lstrip("\n")
                     else:
-                        separated_chain.insert(image_index + 1, Comp.Plain("\n"))
+                        separated_chain.insert(
+                            image_index + 1, Comp.Plain(boundary_marker)
+                        )
 
             image_index += 1
 
         return separated_chain
+
+    @staticmethod
+    def _separate_rendered_table_images(chain, rendered_image_ids: set[int]):
+        """Backward-compatible alias for callers/tests from v0.2.6."""
+        return MarkdownKillerPlugin._separate_rendered_images(chain, rendered_image_ids)
 
     def _apply_table_fallback(self, table_md: str) -> str | None:
         """Return fallback text for a table block according to table_render_fallback config."""
@@ -377,10 +508,12 @@ class MarkdownKillerPlugin(Star):
             lines.append(" | ".join(row))
         return "\n".join(lines)
 
-    def _log_cleaned_text(self, original_text: str, cleaned_text: str, source: str = ""):
+    def _log_cleaned_text(
+        self, original_text: str, cleaned_text: str, source: str = ""
+    ):
         """输出 Markdown 清理日志，source 用于区分全局过滤等来源。"""
-        original_preview = original_text[:50].replace('\n', '\\n')
-        cleaned_preview = cleaned_text[:50].replace('\n', '\\n')
+        original_preview = original_text[:50].replace("\n", "\\n")
+        cleaned_preview = cleaned_text[:50].replace("\n", "\\n")
         source_prefix = f" {source}" if source else ""
         log_msg = (
             "\n[Markdown Killer] --------------------------------------------------"

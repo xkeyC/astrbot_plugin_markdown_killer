@@ -129,7 +129,9 @@ _SAFE_LINK_SCHEMES = {"http", "https", "mailto"}
 def _is_safe_link(url: str) -> bool:
     """Return whether ``url`` is safe to place in an HTML ``href``."""
     parsed = urlparse(url.strip())
-    return parsed.scheme.lower() in _SAFE_LINK_SCHEMES and bool(parsed.netloc or parsed.path)
+    return parsed.scheme.lower() in _SAFE_LINK_SCHEMES and bool(
+        parsed.netloc or parsed.path
+    )
 
 
 def _render_emphasis_only(text: str) -> str:
@@ -176,7 +178,9 @@ def _replace_code_spans(text: str, reserve) -> str:
             close = _find_closing_backtick_run(text, content_start, run_length)
             if close != -1:
                 code_text = text[content_start:close]
-                out.append(reserve(f"<code>{html.escape(code_text, quote=False)}</code>"))
+                out.append(
+                    reserve(f"<code>{html.escape(code_text, quote=False)}</code>")
+                )
                 i = close + run_length
                 continue
         out.append(text[i])
@@ -244,8 +248,13 @@ def build_table_html(header_cells: list[str], body_rows: list[list[str]]) -> str
 body {{
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans', Helvetica, Arial, sans-serif, 'PingFang SC', 'Microsoft YaHei', 'Hiragino Sans GB';
   background: transparent;
-  padding: 12px;
+  padding: 0;
   display: inline-block;
+}}
+.table-image {{
+  display: inline-block;
+  padding: 9px 12px;
+  background: #ffffff;
 }}
 table {{
   border-collapse: collapse;
@@ -291,7 +300,7 @@ code {{
 }}
 </style></head>
 <body>
-{table_html}
+<div class="table-image">{table_html}</div>
 </body></html>"""
 
 
@@ -319,7 +328,9 @@ async def render_table_to_image_bytes(
     try:
         return await render_html_to_image(
             html_content=html_content,
-            selector="table",
+            # Capture the padded wrapper, not only the table. The physical
+            # margin survives adapters that collapse Plain("\n") components.
+            selector=".table-image",
             width=1400,
             scale_factor=2,
             timeout=timeout,

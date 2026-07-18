@@ -43,5 +43,22 @@
             "raw",
             "remove"
         ]
+    },
+    "enable_formula_render": {
+        "description": "启用 LaTeX 公式图片渲染",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，将块级公式（\\[...\\]、$$...$$）渲染为独立图片；包含行内公式（\\(...\\)、$...$）的整行会合并渲染为一张图片，以保持文字和公式基线对齐。渲染完全使用本地 latex2mathml 与 Chromium，不依赖 CDN。"
+    },
+    "formula_render_fallback": {
+        "description": "公式渲染失败回退策略",
+        "type": "string",
+        "default": "raw",
+        "hint": "公式图片渲染失败时：raw=保留原始 LaTeX 定界符；text=去掉块级公式定界符并保留内容；remove=丢弃公式片段。",
+        "options": [
+            "raw",
+            "text",
+            "remove"
+        ]
     }
 }

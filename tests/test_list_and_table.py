@@ -42,6 +42,11 @@ sys.modules["astrbot.api.logger"] = _logger_stub
 
 # Now safe to import the real modules.
 from utils.list_processor import remove_list_markers  # noqa: E402
+from utils.formula_renderer import (  # noqa: E402
+    build_formula_html,
+    contains_latex_formulas,
+    split_text_around_formulas,
+)
 from utils.table_renderer import (  # noqa: E402
     build_table_html,
     detect_markdown_tables,
@@ -69,7 +74,9 @@ def remove_markdown_smart_join(text, remove_markdown_no_tables_fn=None):
     newlines, which is the real bug trigger). Defaults to identity.
     """
     if remove_markdown_no_tables_fn is None:
-        remove_markdown_no_tables_fn = lambda x: x
+
+        def remove_markdown_no_tables_fn(value):
+            return value
 
     blocks = split_text_around_tables_local(text)
     result = ""
@@ -182,7 +189,9 @@ def test_list_removal_adaptive_merge():
     assert actual == short_unord_expected, (
         f"FAIL short-unordered preserve: {actual!r} (expected {short_unord_expected!r})"
     )
-    print(f"OK  short-unord:  marker shapes preserved despite threshold=0 -> {actual!r}")
+    print(
+        f"OK  short-unord:  marker shapes preserved despite threshold=0 -> {actual!r}"
+    )
 
     long_unord_in = (
         "- 第一项这是一段比较长的说明文字\n"
@@ -291,6 +300,9 @@ def _new_plugin_for_tests():
     plugin.remove_extra_newlines = True
     plugin.newline_mode = "segment_boundary"
     plugin.list_merge_char_threshold = 30
+    plugin.enable_formula_render = True
+    plugin.formula_render_fallback = "raw"
+    plugin._formula_render_failure_logged = False
     return plugin
 
 
@@ -333,7 +345,9 @@ def test_remove_markdown_preserves_list_newlines():
     assert actual == "第一句。第二句。", (
         f"FAIL paragraph cleanup: non-list newline behavior changed: {actual!r}"
     )
-    print(f"OK  paragraph:    non-list segment-boundary cleanup unchanged -> {actual!r}")
+    print(
+        f"OK  paragraph:    non-list segment-boundary cleanup unchanged -> {actual!r}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -371,34 +385,22 @@ def test_table_parse():
         "| expr | note |\n|---|---|\n| `a | b` | escaped \\| pipe |\n"
     )
     assert header == ["expr", "note"], f"FAIL parse pipes header: {header!r}"
-    assert body == [["`a | b`", "escaped | pipe"]], (
-        f"FAIL parse pipes body: {body!r}"
-    )
+    assert body == [["`a | b`", "escaped | pipe"]], f"FAIL parse pipes body: {body!r}"
     print("OK  parse-pipes:  code/escaped pipes stay inside cells")
 
-    header, body = parse_markdown_table(
-        "| a | b |\n|---|---|\n| \\`x | y |\n"
-    )
+    header, body = parse_markdown_table("| a | b |\n|---|---|\n| \\`x | y |\n")
     assert header == ["a", "b"], f"FAIL parse escaped-backtick header: {header!r}"
-    assert body == [["`x", "y"]], (
-        f"FAIL parse escaped-backtick body: {body!r}"
-    )
+    assert body == [["`x", "y"]], f"FAIL parse escaped-backtick body: {body!r}"
     print("OK  parse-escape: escaped backtick does not hide column pipe")
 
-    header, body = parse_markdown_table(
-        "| a | b |\n|---|---|\n| ``x | y`` | z |\n"
-    )
+    header, body = parse_markdown_table("| a | b |\n|---|---|\n| ``x | y`` | z |\n")
     assert header == ["a", "b"], f"FAIL parse multi-code header: {header!r}"
-    assert body == [["``x | y``", "z"]], (
-        f"FAIL parse multi-code body: {body!r}"
-    )
+    assert body == [["``x | y``", "z"]], f"FAIL parse multi-code body: {body!r}"
     print("OK  parse-code:   multi-backtick code span keeps pipe inside cell")
 
 
 def test_split_text_around_tables():
-    segments = split_text_around_tables(
-        "intro\n| a | b |\n|---|---|\n| 1 | 2 |\ntail"
-    )
+    segments = split_text_around_tables("intro\n| a | b |\n|---|---|\n| 1 | 2 |\ntail")
     assert len(segments) == 3, (
         f"FAIL split: expected 3 segments, got {len(segments)}: {segments!r}"
     )
@@ -417,6 +419,10 @@ def test_build_table_html_smoke():
     assert "<table>" in html, "FAIL build_table_html: missing <table>"
     assert "<th>a</th>" in html, "FAIL build_table_html: header cell missing"
     assert "<td>1</td>" in html, "FAIL build_table_html: body cell missing"
+    assert 'class="table-image"' in html, (
+        "FAIL build_table_html: padded wrapper missing"
+    )
+    assert "padding: 9px 12px" in html, "FAIL build_table_html: image padding missing"
     # Ensure HTML escaping is applied for special chars.
     html2 = build_table_html(["x & y"], [["<b>bold</b>"]])
     assert "&amp;" in html2, "FAIL build_table_html: ampersand not escaped"
@@ -474,9 +480,9 @@ def test_build_table_html_github_style():
     html = build_table_html(["Name", "Value"], [["foo", "bar"]])
     # Required GitHub-style colors / values.
     required = [
-        "#f6f8fa",          # thead bg + zebra row bg
-        "#d0d7de",          # border color
-        "#1f2328",          # text color
+        "#f6f8fa",  # thead bg + zebra row bg
+        "#d0d7de",  # border color
+        "#1f2328",  # text color
         "border-radius: 6px",
         "font-size: 14px",
         "padding: 8px 13px",
@@ -525,7 +531,9 @@ def test_screenshot_viewport_uses_measured_content_size():
     assert viewport["width"] == 2624, f"FAIL viewport width: {viewport!r}"
     assert viewport["height"] == 12024, f"FAIL viewport height: {viewport!r}"
 
-    viewport = _calculate_screenshot_viewport({"targetWidth": 800, "targetHeight": 50}, 1400)
+    viewport = _calculate_screenshot_viewport(
+        {"targetWidth": 800, "targetHeight": 50}, 1400
+    )
     assert viewport["width"] == 1400, f"FAIL viewport min-width: {viewport!r}"
     assert viewport["height"] >= 50, f"FAIL viewport height small: {viewport!r}"
     print("OK  viewport:     measured dimensions drive screenshot viewport")
@@ -594,8 +602,10 @@ def test_table_after_paragraph():
     assert len(detect_markdown_tables(result)) == 1, (
         f"FAIL user-scenario: detect_markdown_tables found 0 matches in {result!r}"
     )
-    print(f"OK  user-scenario: header on own line; detect=1")
-    print(f"     result preview: {result.splitlines()[0]!r} / {result.splitlines()[1]!r}")
+    print("OK  user-scenario: header on own line; detect=1")
+    print(
+        f"     result preview: {result.splitlines()[0]!r} / {result.splitlines()[1]!r}"
+    )
 
     # ------------------------------------------------------------------
     # Case 3: text-only input unchanged (no table-related newline logic).
@@ -623,10 +633,8 @@ def test_table_after_paragraph():
     # ------------------------------------------------------------------
     once = remove_markdown_smart_join(user_input, _strip_trailing_newlines)
     twice = remove_markdown_smart_join(once, _strip_trailing_newlines)
-    assert once == twice, (
-        f"FAIL idempotency: once={once!r} twice={twice!r}"
-    )
-    print(f"OK  idempotency:  output stable under re-application")
+    assert once == twice, f"FAIL idempotency: once={once!r} twice={twice!r}"
+    print("OK  idempotency:  output stable under re-application")
 
     # ------------------------------------------------------------------
     # Case 5: pre-bug simulation — the buggy version MUST reproduce the bug.
@@ -660,7 +668,9 @@ def test_table_after_paragraph():
     assert len(detect_markdown_tables(buggy_user)) == 0, (
         f"FAIL buggy-user: detect unexpectedly found table in {buggy_user!r}"
     )
-    print(f"OK  buggy-user:    reproduces glue (silent failure) -> {buggy_user[:60]!r}...")
+    print(
+        f"OK  buggy-user:    reproduces glue (silent failure) -> {buggy_user[:60]!r}..."
+    )
 
 
 def test_rendered_table_images_have_block_boundaries():
@@ -692,20 +702,20 @@ def test_rendered_table_images_have_block_boundaries():
         asyncio.run(plugin._render_tables_in_chain(surrounded))
         assert len(surrounded.chain) == 3, surrounded.chain
         assert isinstance(surrounded.chain[0], Plain)
-        assert surrounded.chain[0].text == "before\n"
+        assert surrounded.chain[0].text == "before\n\n"
         assert isinstance(surrounded.chain[1], Image)
         assert isinstance(surrounded.chain[2], Plain)
-        assert surrounded.chain[2].text == "\nafter"
+        assert surrounded.chain[2].text == "\n\nafter"
         assert surrounded.disable_segment_reply is True
 
         at_start = _Result([Plain(f"{table}after")])
         asyncio.run(plugin._render_tables_in_chain(at_start))
         assert isinstance(at_start.chain[0], Image)
-        assert at_start.chain[1].text == "\nafter"
+        assert at_start.chain[1].text == "\n\nafter"
 
         at_end = _Result([Plain(f"before\n{table}")])
         asyncio.run(plugin._render_tables_in_chain(at_end))
-        assert at_end.chain[0].text == "before\n"
+        assert at_end.chain[0].text == "before\n\n"
         assert isinstance(at_end.chain[1], Image)
         assert len(at_end.chain) == 2
 
@@ -714,7 +724,7 @@ def test_rendered_table_images_have_block_boundaries():
         assert len(two_tables.chain) == 3, two_tables.chain
         assert isinstance(two_tables.chain[0], Image)
         assert isinstance(two_tables.chain[1], Plain)
-        assert two_tables.chain[1].text == "\n"
+        assert two_tables.chain[1].text == "\n\u200b\n"
         assert isinstance(two_tables.chain[2], Image)
         # Simulate global Markdown cleanup trimming the separator, then verify
         # the post-cleanup spacing pass restores it.
@@ -726,7 +736,7 @@ def test_rendered_table_images_have_block_boundaries():
         two_tables.chain = plugin._separate_rendered_table_images(
             two_tables.chain, image_ids
         )
-        assert two_tables.chain[1].text == "\n"
+        assert two_tables.chain[1].text == "\n\u200b\n"
 
         rendered = Image(b"table")
         empty_before = Plain("")
@@ -736,7 +746,7 @@ def test_rendered_table_images_have_block_boundaries():
         )
         assert separated == before_with_empty
         assert separated[0].text == "before"
-        assert separated[1].text == "\n"
+        assert separated[1].text == "\n\u200b\n"
 
         rendered = Image(b"table")
         empty_after = Plain("")
@@ -745,7 +755,7 @@ def test_rendered_table_images_have_block_boundaries():
             after_with_empty, {id(rendered)}
         )
         assert separated == after_with_empty
-        assert separated[1].text == "\n"
+        assert separated[1].text == "\n\u200b\n"
         assert separated[2].text == "after"
 
         untouched_plain = Plain("plain **markdown** text")
@@ -815,9 +825,9 @@ def test_global_cleanup_restores_boundaries_across_empty_plain():
 
         assert len(result.chain) == 5, result.chain
         assert result.chain[0].text == "before"
-        assert result.chain[1].text == "\n"
+        assert result.chain[1].text == "\n\u200b\n"
         assert isinstance(result.chain[2], Image)
-        assert result.chain[3].text == "\n"
+        assert result.chain[3].text == "\n\u200b\n"
         assert result.chain[4].text == "after"
 
         first_pass = list(result.chain)
@@ -826,12 +836,95 @@ def test_global_cleanup_restores_boundaries_across_empty_plain():
             result.chain, rendered_ids
         )
         assert result.chain == first_pass
-        assert result.chain[1].text == "\n"
-        assert result.chain[3].text == "\n"
+        assert result.chain[1].text == "\n\u200b\n"
+        assert result.chain[3].text == "\n\u200b\n"
     finally:
         renderer_globals["render_table_to_image_bytes"] = original_renderer
 
     print("OK  global-spacing: cleanup-empty Plain boundaries restored idempotently")
+
+
+def test_formula_detection_and_splitting():
+    text = (
+        "intro\n"
+        "\\[L=T-V\\]\n"
+        "其中 \\(q\\) 是坐标，\\(t\\) 是时间。\n"
+        "`\\(code\\)` and ```\n$$not_math$$\n```\n"
+        "$$S=\\int L\\,dt$$\n"
+    )
+    assert contains_latex_formulas(text)
+    segments = split_text_around_formulas(text)
+    formulas = [segment for segment in segments if segment["type"] == "formula"]
+    assert [segment["display"] for segment in formulas] == [True, False, True]
+    assert formulas[0]["text"] == "L=T-V"
+    assert formulas[1]["text"] == "其中 \\(q\\) 是坐标，\\(t\\) 是时间。"
+    assert formulas[2]["text"] == "S=\\int L\\,dt"
+    assert not contains_latex_formulas("价格是 $5，代码为 `\\(x\\)`")
+    assert not contains_latex_formulas("价格区间是 $5-$10")
+    print("OK  formula-split: block/inline formulas found; code spans ignored")
+
+
+def test_build_formula_html():
+    block_html = build_formula_html(
+        r"\frac{d}{dt}\frac{\partial L}{\partial \dot y}=0", display=True
+    )
+    assert "<math" in block_html and 'display="block"' in block_html
+    assert "<mfrac>" in block_html and "&#x02202;" in block_html
+    assert block_html.count('display="block"') == 1
+    assert 'class="formula-image display-formula"' in block_html
+
+    inline_html = build_formula_html(
+        r"其中 \(q\) 是坐标，\(\dot q\) 是速度。", display=False
+    )
+    assert "其中 " in inline_html and " 是速度。" in inline_html
+    assert inline_html.count("<math") == 2
+    assert 'class="formula-image inline-formula-line"' in inline_html
+    print("OK  formula-html: local LaTeX-to-MathML conversion builds both layouts")
+
+
+def test_formula_rendering_chain_and_fallback():
+    plugin = _new_plugin_for_tests()
+    renderer_globals = plugin._render_formulas_in_chain.__func__.__globals__
+    original_renderer = renderer_globals["render_formula_to_image_bytes"]
+
+    async def fake_renderer(source, display, timeout=20000):
+        return f"{display}:{source}".encode()
+
+    renderer_globals["render_formula_to_image_bytes"] = fake_renderer
+    components = renderer_globals["Comp"]
+    Plain = components.Plain
+    Image = components.Image
+
+    class _Result:
+        def __init__(self, chain):
+            self.chain = chain
+            self.disable_segment_reply = False
+
+    try:
+        block = _Result([Plain("before\n\\[x^2\\]\nafter")])
+        ids = asyncio.run(plugin._render_formulas_in_chain(block))
+        assert len(ids) == 1
+        assert block.chain[0].text == "before\n\n"
+        assert isinstance(block.chain[1], Image)
+        assert block.chain[2].text == "\n\nafter"
+        assert block.disable_segment_reply is True
+
+        inline = _Result([Plain("value \\(q\\) at \\(t\\).")])
+        asyncio.run(plugin._render_formulas_in_chain(inline))
+        assert len(inline.chain) == 1 and isinstance(inline.chain[0], Image)
+
+        async def failed_renderer(source, display, timeout=20000):
+            return None
+
+        renderer_globals["render_formula_to_image_bytes"] = failed_renderer
+        fallback = _Result([Plain("before \\(q\\) after")])
+        asyncio.run(plugin._render_formulas_in_chain(fallback))
+        assert len(fallback.chain) == 1
+        assert fallback.chain[0].text == "before \\(q\\) after"
+    finally:
+        renderer_globals["render_formula_to_image_bytes"] = original_renderer
+
+    print("OK  formula-chain: block/inline rendering and raw fallback preserve order")
 
 
 def main():
@@ -852,6 +945,9 @@ def main():
     test_table_after_paragraph()
     test_rendered_table_images_have_block_boundaries()
     test_global_cleanup_restores_boundaries_across_empty_plain()
+    test_formula_detection_and_splitting()
+    test_build_formula_html()
+    test_formula_rendering_chain_and_fallback()
     print("=" * 70)
     print("ALL TESTS PASSED")
     print("=" * 70)
