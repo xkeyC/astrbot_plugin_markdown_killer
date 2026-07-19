@@ -65,7 +65,7 @@ def _is_list_context_line(
     "astrbot_plugin_markdown_killer",
     "xkeyC",
     "移除输出中的Markdown格式（保留列表标记换行、支持表格与公式图片渲染）",
-    "0.3.0",
+    "0.3.1",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):
@@ -414,13 +414,13 @@ class MarkdownKillerPlugin(Star):
 
     @staticmethod
     def _separate_rendered_images(chain, rendered_image_ids: set[int]):
-        """Add stable blank-line boundaries around images rendered here.
+        """Add stable single-newline boundaries around images rendered here.
 
         A standalone newline-only Plain component may be discarded by message
         adapters. The zero-width-space marker keeps an image-to-image boundary
-        non-empty while the surrounding newlines provide actual visual space.
+        non-empty while the single newline keeps adjacent content on its own line.
         """
-        boundary_marker = "\n\u200b\n"
+        boundary_marker = "\n\u200b"
 
         def is_boundary_placeholder(component) -> bool:
             return isinstance(component, Comp.Plain) and (
@@ -451,7 +451,7 @@ class MarkdownKillerPlugin(Star):
                     previous = separated_chain[previous_index]
                     if isinstance(previous, Comp.Plain):
                         if previous.text:
-                            previous.text = previous.text.rstrip("\n") + "\n\n"
+                            previous.text = previous.text.rstrip("\n") + "\n"
                     else:
                         separated_chain.insert(image_index, Comp.Plain(boundary_marker))
                         image_index += 1
@@ -469,7 +469,7 @@ class MarkdownKillerPlugin(Star):
                     following = separated_chain[next_index]
                     if isinstance(following, Comp.Plain):
                         if following.text:
-                            following.text = "\n\n" + following.text.lstrip("\n")
+                            following.text = "\n" + following.text.lstrip("\n")
                     else:
                         separated_chain.insert(
                             image_index + 1, Comp.Plain(boundary_marker)

@@ -702,20 +702,20 @@ def test_rendered_table_images_have_block_boundaries():
         asyncio.run(plugin._render_tables_in_chain(surrounded))
         assert len(surrounded.chain) == 3, surrounded.chain
         assert isinstance(surrounded.chain[0], Plain)
-        assert surrounded.chain[0].text == "before\n\n"
+        assert surrounded.chain[0].text == "before\n"
         assert isinstance(surrounded.chain[1], Image)
         assert isinstance(surrounded.chain[2], Plain)
-        assert surrounded.chain[2].text == "\n\nafter"
+        assert surrounded.chain[2].text == "\nafter"
         assert surrounded.disable_segment_reply is True
 
         at_start = _Result([Plain(f"{table}after")])
         asyncio.run(plugin._render_tables_in_chain(at_start))
         assert isinstance(at_start.chain[0], Image)
-        assert at_start.chain[1].text == "\n\nafter"
+        assert at_start.chain[1].text == "\nafter"
 
         at_end = _Result([Plain(f"before\n{table}")])
         asyncio.run(plugin._render_tables_in_chain(at_end))
-        assert at_end.chain[0].text == "before\n\n"
+        assert at_end.chain[0].text == "before\n"
         assert isinstance(at_end.chain[1], Image)
         assert len(at_end.chain) == 2
 
@@ -724,7 +724,7 @@ def test_rendered_table_images_have_block_boundaries():
         assert len(two_tables.chain) == 3, two_tables.chain
         assert isinstance(two_tables.chain[0], Image)
         assert isinstance(two_tables.chain[1], Plain)
-        assert two_tables.chain[1].text == "\n\u200b\n"
+        assert two_tables.chain[1].text == "\n\u200b"
         assert isinstance(two_tables.chain[2], Image)
         # Simulate global Markdown cleanup trimming the separator, then verify
         # the post-cleanup spacing pass restores it.
@@ -736,7 +736,7 @@ def test_rendered_table_images_have_block_boundaries():
         two_tables.chain = plugin._separate_rendered_table_images(
             two_tables.chain, image_ids
         )
-        assert two_tables.chain[1].text == "\n\u200b\n"
+        assert two_tables.chain[1].text == "\n\u200b"
 
         rendered = Image(b"table")
         empty_before = Plain("")
@@ -746,7 +746,7 @@ def test_rendered_table_images_have_block_boundaries():
         )
         assert separated == before_with_empty
         assert separated[0].text == "before"
-        assert separated[1].text == "\n\u200b\n"
+        assert separated[1].text == "\n\u200b"
 
         rendered = Image(b"table")
         empty_after = Plain("")
@@ -755,7 +755,7 @@ def test_rendered_table_images_have_block_boundaries():
             after_with_empty, {id(rendered)}
         )
         assert separated == after_with_empty
-        assert separated[1].text == "\n\u200b\n"
+        assert separated[1].text == "\n\u200b"
         assert separated[2].text == "after"
 
         untouched_plain = Plain("plain **markdown** text")
@@ -825,9 +825,9 @@ def test_global_cleanup_restores_boundaries_across_empty_plain():
 
         assert len(result.chain) == 5, result.chain
         assert result.chain[0].text == "before"
-        assert result.chain[1].text == "\n\u200b\n"
+        assert result.chain[1].text == "\n\u200b"
         assert isinstance(result.chain[2], Image)
-        assert result.chain[3].text == "\n\u200b\n"
+        assert result.chain[3].text == "\n\u200b"
         assert result.chain[4].text == "after"
 
         first_pass = list(result.chain)
@@ -836,8 +836,8 @@ def test_global_cleanup_restores_boundaries_across_empty_plain():
             result.chain, rendered_ids
         )
         assert result.chain == first_pass
-        assert result.chain[1].text == "\n\u200b\n"
-        assert result.chain[3].text == "\n\u200b\n"
+        assert result.chain[1].text == "\n\u200b"
+        assert result.chain[3].text == "\n\u200b"
     finally:
         renderer_globals["render_table_to_image_bytes"] = original_renderer
 
@@ -904,9 +904,9 @@ def test_formula_rendering_chain_and_fallback():
         block = _Result([Plain("before\n\\[x^2\\]\nafter")])
         ids = asyncio.run(plugin._render_formulas_in_chain(block))
         assert len(ids) == 1
-        assert block.chain[0].text == "before\n\n"
+        assert block.chain[0].text == "before\n"
         assert isinstance(block.chain[1], Image)
-        assert block.chain[2].text == "\n\nafter"
+        assert block.chain[2].text == "\nafter"
         assert block.disable_segment_reply is True
 
         inline = _Result([Plain("value \\(q\\) at \\(t\\).")])
