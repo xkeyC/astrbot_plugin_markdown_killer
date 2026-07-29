@@ -186,6 +186,77 @@ math {{ font-size: 1.15em; vertical-align: -0.12em; }}
 <body><div class="formula-image {content_class}">{content_html}</div></body></html>"""
 
 
+def build_formula_message_html(source: str) -> str:
+    """Build one image document for a complete message containing formulas."""
+    if not contains_latex_formulas(source):
+        raise ValueError("消息中未找到公式")
+
+    segments = split_text_around_formulas(source)
+    pieces: list[str] = []
+    skip_leading_newline = False
+    for segment in segments:
+        if segment["type"] == "text":
+            text = segment["text"]
+            if skip_leading_newline:
+                text = re.sub(r"^(?:\r\n|\r|\n)", "", text, count=1)
+                skip_leading_newline = False
+            pieces.append(html.escape(text, quote=False))
+            continue
+
+        if segment["display"]:
+            if pieces:
+                pieces[-1] = re.sub(r"(?:\r\n|\r|\n)$", "", pieces[-1], count=1)
+            pieces.append(
+                '<div class="display-formula">'
+                f"{_convert_latex(segment['text'], display=True)}"
+                "</div>"
+            )
+            skip_leading_newline = True
+            continue
+
+        inline_pieces: list[str] = []
+        cursor = 0
+        for match in _inline_matches(segment["text"]):
+            inline_pieces.append(
+                html.escape(segment["text"][cursor : match.start()], quote=False)
+            )
+            inline_pieces.append(_convert_latex(_formula_source(match), display=False))
+            cursor = match.end()
+        inline_pieces.append(html.escape(segment["text"][cursor:], quote=False))
+        pieces.append("".join(inline_pieces))
+
+    content_html = "".join(pieces)
+    return f"""<!DOCTYPE html>
+<html><head><meta charset="utf-8">
+<style>
+* {{ box-sizing: border-box; }}
+html, body {{ margin: 0; padding: 0; background: transparent; }}
+.formula-message {{
+  display: block;
+  width: max-content;
+  max-width: 1100px;
+  padding: 12px 16px;
+  color: #1f2328;
+  background: #ffffff;
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans',
+    Helvetica, Arial, sans-serif, 'PingFang SC', 'Microsoft YaHei';
+  font-size: 18px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}}
+.display-formula {{
+  display: flex;
+  min-width: 120px;
+  justify-content: center;
+  padding: 6px 0;
+  white-space: normal;
+}}
+math {{ font-size: 1.15em; vertical-align: -0.12em; }}
+</style></head>
+<body><div class="formula-message">{content_html}</div></body></html>"""
+
+
 async def render_formula_to_image_bytes(
     source: str, display: bool, timeout: int = 30000
 ) -> bytes | None:
@@ -211,4 +282,32 @@ async def render_formula_to_image_bytes(
         )
     except Exception as exc:
         logger.error(f"渲染公式图片失败: {exc}")
+        return None
+
+
+async def render_formula_message_to_image_bytes(
+    source: str, timeout: int = 30000
+) -> bytes | None:
+    """Render a complete prose-and-formula message to one PNG."""
+    try:
+        html_content = build_formula_message_html(source)
+    except Exception as exc:
+        logger.error(f"构建公式消息 HTML 失败: {exc}")
+        return None
+
+    try:
+        from .browser import render_html_to_image
+    except ImportError:  # pragma: no cover - top-level import fallback
+        from browser import render_html_to_image
+
+    try:
+        return await render_html_to_image(
+            html_content=html_content,
+            selector=".formula-message",
+            width=1400,
+            scale_factor=2,
+            timeout=timeout,
+        )
+    except Exception as exc:
+        logger.error(f"渲染公式消息图片失败: {exc}")
         return None

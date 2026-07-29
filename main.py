@@ -12,7 +12,7 @@ try:
         contains_latex_formulas,
         detect_markdown_tables,
         parse_markdown_table,
-        render_formula_to_image_bytes,
+        render_formula_message_to_image_bytes,
         render_table_to_image_bytes,
         split_text_around_formulas,
         split_text_around_tables,
@@ -25,7 +25,7 @@ except ImportError:  # pragma: no cover - fallback when loaded as top-level modu
         contains_latex_formulas,
         detect_markdown_tables,
         parse_markdown_table,
-        render_formula_to_image_bytes,
+        render_formula_message_to_image_bytes,
         render_table_to_image_bytes,
         split_text_around_formulas,
         split_text_around_tables,
@@ -187,10 +187,10 @@ class MarkdownKillerPlugin(Star):
 
         # Phase 1: extract tables/formulas and render them to images.
         rendered_image_ids: set[int] = set()
-        if self.enable_table_render and self._playwright_available:
-            rendered_image_ids.update(await self._render_tables_in_chain(result))
         if self.enable_formula_render and self._playwright_available:
             rendered_image_ids.update(await self._render_formulas_in_chain(result))
+        if self.enable_table_render and self._playwright_available:
+            rendered_image_ids.update(await self._render_tables_in_chain(result))
 
         # Phase 2: global markdown removal (only when enabled).
         if self._config_get("enable_global_markdown_killer", False):
@@ -318,81 +318,85 @@ class MarkdownKillerPlugin(Star):
         return segments
 
     async def _render_formulas_in_chain(self, result) -> set[int]:
-        """Render block formulas and inline-formula lines, preserving chain order."""
+        """Render each complete contiguous text message containing math as one image."""
         start_ts = time.perf_counter()
-        jobs: list[tuple[int, int, str, bool]] = []
-        component_segments: dict[int, list[dict]] = {}
-
-        for comp_index, comp in enumerate(result.chain):
+        jobs: list[tuple[int, int, str]] = []
+        comp_index = 0
+        while comp_index < len(result.chain):
+            comp = result.chain[comp_index]
             text = getattr(comp, "text", None)
-            if not (
-                isinstance(comp, Comp.Plain)
-                and isinstance(text, str)
-                and contains_latex_formulas(text)
-            ):
+            if not isinstance(comp, Comp.Plain) or not isinstance(text, str):
+                comp_index += 1
                 continue
-            segments = self._split_formula_blocks(text)
-            component_segments[comp_index] = segments
-            for seg_index, segment in enumerate(segments):
-                if segment["type"] == "formula":
-                    jobs.append(
-                        (
-                            comp_index,
-                            seg_index,
-                            segment["text"],
-                            bool(segment["display"]),
-                        )
-                    )
+
+            run_start = comp_index
+            run_text = []
+            while comp_index < len(result.chain):
+                run_comp = result.chain[comp_index]
+                run_comp_text = getattr(run_comp, "text", None)
+                if not (
+                    isinstance(run_comp, Comp.Plain) and isinstance(run_comp_text, str)
+                ):
+                    break
+                run_text.append(run_comp_text)
+                comp_index += 1
+
+            source = "".join(run_text)
+            if contains_latex_formulas(source):
+                jobs.append((run_start, comp_index, source))
 
         if not jobs:
             return set()
 
         gathered = await asyncio.gather(
             *[
-                render_formula_to_image_bytes(source, display, timeout=20000)
-                for _, _, source, display in jobs
+                render_formula_message_to_image_bytes(source, timeout=20000)
+                for _, _, source in jobs
             ],
             return_exceptions=True,
         )
-        results: dict[tuple[int, int], bytes | None] = {}
-        for (comp_index, seg_index, _, _), outcome in zip(jobs, gathered):
-            results[(comp_index, seg_index)] = (
-                None if isinstance(outcome, Exception) else outcome
-            )
+        results: dict[int, bytes | None] = {
+            run_start: None if isinstance(outcome, Exception) else outcome
+            for (run_start, _, _), outcome in zip(jobs, gathered)
+        }
+        jobs_by_start = {
+            run_start: (run_end, source) for run_start, run_end, source in jobs
+        }
 
         new_chain = []
         rendered_image_ids: set[int] = set()
-        for comp_index, comp in enumerate(result.chain):
-            segments = component_segments.get(comp_index)
-            if segments is None:
-                new_chain.append(comp)
+        comp_index = 0
+        while comp_index < len(result.chain):
+            job = jobs_by_start.get(comp_index)
+            if job is None:
+                new_chain.append(result.chain[comp_index])
+                comp_index += 1
                 continue
-            for seg_index, segment in enumerate(segments):
-                if segment["type"] == "text":
-                    if segment["text"]:
-                        new_chain.append(Comp.Plain(segment["text"]))
-                    continue
 
-                image_bytes = results.get((comp_index, seg_index))
-                if image_bytes:
-                    image = Comp.Image.fromBytes(image_bytes)
-                    new_chain.append(image)
-                    rendered_image_ids.add(id(image))
-                    logger.debug("[MarkdownKiller] 公式已渲染为图片")
-                    continue
+            run_end, _ = job
+            image_bytes = results.get(comp_index)
+            if image_bytes:
+                image = Comp.Image.fromBytes(image_bytes)
+                new_chain.append(image)
+                rendered_image_ids.add(id(image))
+                logger.debug("[MarkdownKiller] 含公式的完整消息已渲染为图片")
+                comp_index = run_end
+                continue
 
-                fallback = self._apply_formula_fallback(segment)
-                if fallback is not None:
+            for original_comp in result.chain[comp_index:run_end]:
+                fallback = self._apply_formula_fallback_to_text(original_comp.text)
+                if fallback:
                     new_chain.append(Comp.Plain(fallback))
-                fallback_msg = (
-                    "[MarkdownKiller] 公式渲染失败，已按 "
-                    f"{self.formula_render_fallback} 策略回退"
-                )
-                if not self._formula_render_failure_logged:
-                    logger.warning(fallback_msg)
-                    self._formula_render_failure_logged = True
-                else:
-                    logger.debug(fallback_msg)
+            fallback_msg = (
+                "[MarkdownKiller] 公式消息渲染失败，已按 "
+                f"{self.formula_render_fallback} 策略回退"
+            )
+            if not self._formula_render_failure_logged:
+                logger.warning(fallback_msg)
+                self._formula_render_failure_logged = True
+            else:
+                logger.debug(fallback_msg)
+            comp_index = run_end
 
         result.chain = self._separate_rendered_images(new_chain, rendered_image_ids)
         if rendered_image_ids:
@@ -400,9 +404,20 @@ class MarkdownKillerPlugin(Star):
 
         elapsed = time.perf_counter() - start_ts
         logger.info(
-            f"[MarkdownKiller] 渲染 {len(jobs)} 个公式片段，耗时 {elapsed:.2f}s"
+            f"[MarkdownKiller] 渲染 {len(jobs)} 条含公式消息，耗时 {elapsed:.2f}s"
         )
         return rendered_image_ids
+
+    def _apply_formula_fallback_to_text(self, text: str) -> str:
+        parts = []
+        for segment in self._split_formula_blocks(text):
+            if segment["type"] == "text":
+                parts.append(segment["text"])
+                continue
+            fallback = self._apply_formula_fallback(segment)
+            if fallback is not None:
+                parts.append(fallback)
+        return "".join(parts)
 
     def _apply_formula_fallback(self, segment: dict) -> str | None:
         mode = self.formula_render_fallback

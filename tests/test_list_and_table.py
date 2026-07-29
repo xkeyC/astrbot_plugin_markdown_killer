@@ -44,6 +44,7 @@ sys.modules["astrbot.api.logger"] = _logger_stub
 from utils.list_processor import remove_list_markers  # noqa: E402
 from utils.formula_renderer import (  # noqa: E402
     build_formula_html,
+    build_formula_message_html,
     contains_latex_formulas,
     split_text_around_formulas,
 )
@@ -879,18 +880,29 @@ def test_build_formula_html():
     assert "其中 " in inline_html and " 是速度。" in inline_html
     assert inline_html.count("<math") == 2
     assert 'class="formula-image inline-formula-line"' in inline_html
+
+    message_html = build_formula_message_html(
+        "先说明条件。\n\\[E=mc^2\\]\n所以结论成立，且 \\(c\\) 为常数。"
+    )
+    assert 'class="formula-message"' in message_html
+    assert "先说明条件。" in message_html and "所以结论成立" in message_html
+    assert message_html.count("<math") == 2
+    assert "\\[E=mc^2\\]" not in message_html
     print("OK  formula-html: local LaTeX-to-MathML conversion builds both layouts")
 
 
 def test_formula_rendering_chain_and_fallback():
     plugin = _new_plugin_for_tests()
     renderer_globals = plugin._render_formulas_in_chain.__func__.__globals__
-    original_renderer = renderer_globals["render_formula_to_image_bytes"]
+    original_renderer = renderer_globals["render_formula_message_to_image_bytes"]
 
-    async def fake_renderer(source, display, timeout=20000):
-        return f"{display}:{source}".encode()
+    rendered_sources = []
 
-    renderer_globals["render_formula_to_image_bytes"] = fake_renderer
+    async def fake_renderer(source, timeout=20000):
+        rendered_sources.append(source)
+        return source.encode()
+
+    renderer_globals["render_formula_message_to_image_bytes"] = fake_renderer
     components = renderer_globals["Comp"]
     Plain = components.Plain
     Image = components.Image
@@ -901,30 +913,83 @@ def test_formula_rendering_chain_and_fallback():
             self.disable_segment_reply = False
 
     try:
-        block = _Result([Plain("before\n\\[x^2\\]\nafter")])
+        source = "before\n\\[x^2\\]\nafter"
+        block = _Result([Plain("before\n"), Plain("\\[x^2\\]\n"), Plain("after")])
         ids = asyncio.run(plugin._render_formulas_in_chain(block))
         assert len(ids) == 1
-        assert block.chain[0].text == "before\n"
-        assert isinstance(block.chain[1], Image)
-        assert block.chain[2].text == "\nafter"
+        assert len(block.chain) == 1 and isinstance(block.chain[0], Image)
+        assert block.chain[0].data == source.encode()
+        assert rendered_sources == [source]
         assert block.disable_segment_reply is True
 
-        inline = _Result([Plain("value \\(q\\) at \\(t\\).")])
+        inline_source = "prefix\nvalue \\(q\\) at \\(t\\).\nsuffix"
+        inline = _Result([Plain(inline_source)])
         asyncio.run(plugin._render_formulas_in_chain(inline))
         assert len(inline.chain) == 1 and isinstance(inline.chain[0], Image)
+        assert inline.chain[0].data == inline_source.encode()
 
-        async def failed_renderer(source, display, timeout=20000):
+        async def failed_renderer(source, timeout=20000):
             return None
 
-        renderer_globals["render_formula_to_image_bytes"] = failed_renderer
+        renderer_globals["render_formula_message_to_image_bytes"] = failed_renderer
         fallback = _Result([Plain("before \\(q\\) after")])
         asyncio.run(plugin._render_formulas_in_chain(fallback))
         assert len(fallback.chain) == 1
         assert fallback.chain[0].text == "before \\(q\\) after"
     finally:
-        renderer_globals["render_formula_to_image_bytes"] = original_renderer
+        renderer_globals["render_formula_message_to_image_bytes"] = original_renderer
 
-    print("OK  formula-chain: block/inline rendering and raw fallback preserve order")
+    print(
+        "OK  formula-chain: complete mixed messages become one image; raw fallback kept"
+    )
+
+
+def test_formula_decorating_result_is_image_only():
+    """The real pre-send hook must leave no duplicate Plain text around formula images."""
+    plugin = _new_plugin_for_tests()
+    plugin.config = {}
+    plugin.enable_table_render = False
+    plugin._playwright_available = True
+
+    renderer_globals = plugin._render_formulas_in_chain.__func__.__globals__
+    original_renderer = renderer_globals["render_formula_message_to_image_bytes"]
+
+    async def fake_renderer(source, timeout=20000):
+        return source.encode()
+
+    renderer_globals["render_formula_message_to_image_bytes"] = fake_renderer
+    components = renderer_globals["Comp"]
+    Plain = components.Plain
+    Image = components.Image
+
+    class _Result:
+        result_content_type = None
+
+        def __init__(self, chain):
+            self.chain = chain
+            self.disable_segment_reply = False
+
+    class _Event:
+        def __init__(self, result):
+            self.result = result
+
+        def get_result(self):
+            return self.result
+
+    source = "这是一段解释文字。\n\\[F=ma\\]\n公式后的结论也必须留在图内。"
+    try:
+        result = _Result([Plain(source)])
+        asyncio.run(plugin.on_decorating_result(_Event(result)))
+
+        assert len(result.chain) == 1, result.chain
+        assert isinstance(result.chain[0], Image)
+        assert result.chain[0].data == source.encode()
+        assert not any(isinstance(comp, Plain) for comp in result.chain)
+        assert result.disable_segment_reply is True
+    finally:
+        renderer_globals["render_formula_message_to_image_bytes"] = original_renderer
+
+    print("OK  formula-hook: mixed prose/formula outgoing result is one image only")
 
 
 def main():
@@ -948,6 +1013,7 @@ def main():
     test_formula_detection_and_splitting()
     test_build_formula_html()
     test_formula_rendering_chain_and_fallback()
+    test_formula_decorating_result_is_image_only()
     print("=" * 70)
     print("ALL TESTS PASSED")
     print("=" * 70)
