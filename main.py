@@ -164,6 +164,13 @@ class MarkdownKillerPlugin(Star):
             return
 
         original_text = resp.completion_text
+        if (
+            self.enable_formula_render
+            and self._playwright_available
+            and contains_latex_formulas(original_text)
+        ):
+            return
+
         cleaned_text = self.remove_markdown(original_text)
 
         if original_text != cleaned_text:

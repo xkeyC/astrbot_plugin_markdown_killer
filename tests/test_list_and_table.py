@@ -881,14 +881,31 @@ def test_build_formula_html():
     assert inline_html.count("<math") == 2
     assert 'class="formula-image inline-formula-line"' in inline_html
 
-    message_html = build_formula_message_html(
-        "先说明条件。\n\\[E=mc^2\\]\n所以结论成立，且 \\(c\\) 为常数。"
+    message_source = (
+        "# 完整 Markdown 标题\n\n"
+        "**重点内容**与行内公式 \\(c^2\\)。\n\n"
+        "- 第一项\n"
+        "- 第二项\n\n"
+        "> 引用内容\n\n"
+        "```python\nprint('<safe>')\n```\n\n"
+        "| 名称 | 数值 |\n"
+        "| --- | --- |\n"
+        "| 能量 | $E$ |\n\n"
+        "<script>alert('unsafe')</script>\n\n"
+        "\\[E=mc^2\\]"
     )
+    message_html = build_formula_message_html(message_source)
     assert 'class="formula-message"' in message_html
-    assert "先说明条件。" in message_html and "所以结论成立" in message_html
-    assert message_html.count("<math") == 2
+    assert "<h1>完整 Markdown 标题</h1>" in message_html
+    assert "<strong>重点内容</strong>" in message_html
+    assert "<ul>" in message_html and "<blockquote>" in message_html
+    assert "<pre><code" in message_html and "<table>" in message_html
+    assert "&lt;script&gt;" in message_html and "<script>" not in message_html
+    assert message_html.count("<math") == 3
     assert "\\[E=mc^2\\]" not in message_html
-    print("OK  formula-html: local LaTeX-to-MathML conversion builds both layouts")
+    print(
+        "OK  formula-html: complete Markdown and MathML render safely in one document"
+    )
 
 
 def test_formula_rendering_chain_and_fallback():
@@ -945,7 +962,7 @@ def test_formula_rendering_chain_and_fallback():
 
 
 def test_formula_decorating_result_is_image_only():
-    """The real pre-send hook must leave no duplicate Plain text around formula images."""
+    """The LLM/pre-send path must preserve layout and emit only one image."""
     plugin = _new_plugin_for_tests()
     plugin.config = {}
     plugin.enable_table_render = False
@@ -954,7 +971,10 @@ def test_formula_decorating_result_is_image_only():
     renderer_globals = plugin._render_formulas_in_chain.__func__.__globals__
     original_renderer = renderer_globals["render_formula_message_to_image_bytes"]
 
+    rendered_sources = []
+
     async def fake_renderer(source, timeout=20000):
+        rendered_sources.append(source)
         return source.encode()
 
     renderer_globals["render_formula_message_to_image_bytes"] = fake_renderer
@@ -976,20 +996,43 @@ def test_formula_decorating_result_is_image_only():
         def get_result(self):
             return self.result
 
-    source = "这是一段解释文字。\n\\[F=ma\\]\n公式后的结论也必须留在图内。"
+    source = (
+        "## 第2集：鼓点停在第十六小节\n"
+        "上一集的结尾已经结束。\n\n"
+        "## 第3集：贝斯手不说真话\n"
+        "这一段包含公式 \\(F=ma\\)。\n\n"
+        "## 第4集：键盘上的空白\n"
+        "公式后的结论也必须留在图内。"
+    )
+
+    class _Response:
+        def __init__(self, completion_text):
+            self.completion_text = completion_text
+
     try:
-        result = _Result([Plain(source)])
+        response = _Response(source)
+        asyncio.run(plugin.on_llm_resp(None, response))
+        assert response.completion_text == source
+
+        result = _Result([Plain(response.completion_text)])
         asyncio.run(plugin.on_decorating_result(_Event(result)))
 
         assert len(result.chain) == 1, result.chain
         assert isinstance(result.chain[0], Image)
         assert result.chain[0].data == source.encode()
+        assert rendered_sources == [source]
         assert not any(isinstance(comp, Plain) for comp in result.chain)
         assert result.disable_segment_reply is True
+
+        non_formula = _Response("上一集的结尾已经结束。\n\n第3集：普通消息")
+        asyncio.run(plugin.on_llm_resp(None, non_formula))
+        assert non_formula.completion_text == "上一集的结尾已经结束。第3集：普通消息"
     finally:
         renderer_globals["render_formula_message_to_image_bytes"] = original_renderer
 
-    print("OK  formula-hook: mixed prose/formula outgoing result is one image only")
+    print(
+        "OK  formula-hook: Markdown kept for one-image render; plain behavior unchanged"
+    )
 
 
 def main():

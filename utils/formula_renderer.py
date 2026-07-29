@@ -187,45 +187,68 @@ math {{ font-size: 1.15em; vertical-align: -0.12em; }}
 
 
 def build_formula_message_html(source: str) -> str:
-    """Build one image document for a complete message containing formulas."""
+    """Build one Markdown-formatted image document containing MathML formulas."""
     if not contains_latex_formulas(source):
         raise ValueError("消息中未找到公式")
 
-    segments = split_text_around_formulas(source)
-    pieces: list[str] = []
-    skip_leading_newline = False
-    for segment in segments:
-        if segment["type"] == "text":
-            text = segment["text"]
-            if skip_leading_newline:
-                text = re.sub(r"^(?:\r\n|\r|\n)", "", text, count=1)
-                skip_leading_newline = False
-            pieces.append(html.escape(text, quote=False))
-            continue
+    try:
+        import markdown
+    except ImportError as exc:
+        raise RuntimeError("缺少 Markdown 解析依赖") from exc
 
-        if segment["display"]:
-            if pieces:
-                pieces[-1] = re.sub(r"(?:\r\n|\r|\n)$", "", pieces[-1], count=1)
-            pieces.append(
+    code_spans = _code_spans(source)
+    block_matches = [
+        match
+        for match in _BLOCK_FORMULA_RE.finditer(source)
+        if not _overlaps_any(match.start(), match.end(), code_spans)
+    ]
+    block_spans = [(match.start(), match.end()) for match in block_matches]
+    inline_matches = [
+        match
+        for match in _INLINE_FORMULA_RE.finditer(source)
+        if not _overlaps_any(match.start(), match.end(), code_spans)
+        and not _overlaps_any(match.start(), match.end(), block_spans)
+    ]
+    formula_matches = sorted(
+        [(match, True) for match in block_matches]
+        + [(match, False) for match in inline_matches],
+        key=lambda item: item[0].start(),
+    )
+
+    token_prefix = "MKFORMULATOKEN"
+    while token_prefix in source:
+        token_prefix += "X"
+
+    markdown_parts: list[str] = []
+    replacements: dict[str, str] = {}
+    cursor = 0
+    for index, (match, display) in enumerate(formula_matches):
+        markdown_parts.append(source[cursor : match.start()])
+        token = f"{token_prefix}{index}END"
+        if display:
+            markdown_parts.append(f"\n\n{token}\n\n")
+            replacements[token] = (
                 '<div class="display-formula">'
-                f"{_convert_latex(segment['text'], display=True)}"
+                f"{_convert_latex(_formula_source(match), display=True)}"
                 "</div>"
             )
-            skip_leading_newline = True
-            continue
+        else:
+            markdown_parts.append(token)
+            replacements[token] = _convert_latex(_formula_source(match), display=False)
+        cursor = match.end()
+    markdown_parts.append(source[cursor:])
 
-        inline_pieces: list[str] = []
-        cursor = 0
-        for match in _inline_matches(segment["text"]):
-            inline_pieces.append(
-                html.escape(segment["text"][cursor : match.start()], quote=False)
-            )
-            inline_pieces.append(_convert_latex(_formula_source(match), display=False))
-            cursor = match.end()
-        inline_pieces.append(html.escape(segment["text"][cursor:], quote=False))
-        pieces.append("".join(inline_pieces))
+    escaped_markdown = "".join(markdown_parts)
+    escaped_markdown = escaped_markdown.replace("&", "&amp;").replace("<", "&lt;")
+    content_html = markdown.markdown(
+        escaped_markdown,
+        extensions=["extra", "sane_lists", "nl2br"],
+        output_format="html5",
+    )
+    for token, replacement in replacements.items():
+        content_html = content_html.replace(f"<p>{token}</p>", replacement)
+        content_html = content_html.replace(token, replacement)
 
-    content_html = "".join(pieces)
     return f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8">
 <style>
@@ -235,22 +258,74 @@ html, body {{ margin: 0; padding: 0; background: transparent; }}
   display: block;
   width: max-content;
   max-width: 1100px;
-  padding: 12px 16px;
+  padding: 20px 24px;
   color: #1f2328;
   background: #ffffff;
   font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans',
     Helvetica, Arial, sans-serif, 'PingFang SC', 'Microsoft YaHei';
   font-size: 18px;
   line-height: 1.6;
-  white-space: pre-wrap;
   overflow-wrap: anywhere;
 }}
+h1, h2, h3, h4, h5, h6 {{
+  margin: 1em 0 0.45em;
+  line-height: 1.25;
+  font-weight: 650;
+}}
+h1 {{ font-size: 1.65em; }}
+h2 {{ font-size: 1.45em; }}
+h3 {{ font-size: 1.25em; }}
+h4, h5, h6 {{ font-size: 1.08em; }}
+p {{ margin: 0.65em 0; }}
+.formula-message > :first-child {{ margin-top: 0; }}
+.formula-message > :last-child {{ margin-bottom: 0; }}
+strong {{ font-weight: 650; }}
+em {{ font-style: italic; }}
+a {{ color: #0969da; text-decoration: underline; }}
+ul, ol {{ margin: 0.65em 0; padding-left: 1.8em; }}
+li {{ margin: 0.2em 0; }}
+blockquote {{
+  margin: 0.8em 0;
+  padding: 0.15em 0 0.15em 0.9em;
+  color: #59636e;
+  border-left: 4px solid #d0d7de;
+}}
+blockquote > :first-child {{ margin-top: 0; }}
+blockquote > :last-child {{ margin-bottom: 0; }}
+code {{
+  padding: 0.12em 0.35em;
+  border-radius: 4px;
+  background: #eff1f3;
+  font-family: Consolas, 'SFMono-Regular', monospace;
+  font-size: 0.9em;
+}}
+pre {{
+  margin: 0.8em 0;
+  padding: 0.85em 1em;
+  overflow: hidden;
+  border-radius: 6px;
+  background: #f6f8fa;
+  white-space: pre-wrap;
+}}
+pre code {{ padding: 0; background: transparent; }}
+table {{
+  width: 100%;
+  margin: 0.8em 0;
+  border-collapse: collapse;
+}}
+th, td {{
+  padding: 0.4em 0.65em;
+  border: 1px solid #d0d7de;
+  text-align: left;
+}}
+th {{ background: #f6f8fa; font-weight: 650; }}
+hr {{ height: 1px; margin: 1em 0; border: 0; background: #d8dee4; }}
 .display-formula {{
   display: flex;
   min-width: 120px;
   justify-content: center;
-  padding: 6px 0;
-  white-space: normal;
+  margin: 0.85em 0;
+  padding: 0.35em 0;
 }}
 math {{ font-size: 1.15em; vertical-align: -0.12em; }}
 </style></head>
