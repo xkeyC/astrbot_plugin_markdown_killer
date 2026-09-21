@@ -137,6 +137,14 @@ async def close_browser():
         _playwright_instance = None
 
 
+async def _block_network_request(route) -> None:
+    """Allow only inline data: resources; abort any other request."""
+    if route.request.url.startswith(("data:", "about:")):
+        await route.continue_()
+    else:
+        await route.abort()
+
+
 async def _measure_rendered_dimensions(page, selector: str) -> dict:
     """Measure the target element and full document in CSS pixels."""
     return await page.evaluate(
@@ -188,10 +196,14 @@ async def render_html_to_image(
     try:
         from playwright.async_api import ViewportSize
 
+        # Rendered content comes from LLM output: disable page scripts and
+        # block every network request (all assets are inline or data: URIs).
         context = await browser.new_context(
             viewport=ViewportSize(width=width, height=1000),
             device_scale_factor=scale_factor,
+            java_script_enabled=False,
         )
+        await context.route("**/*", _block_network_request)
         page = await context.new_page()
 
         await page.set_content(html_content, wait_until="networkidle", timeout=timeout)

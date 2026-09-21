@@ -1,6 +1,6 @@
-from astrbot.api import AstrBotConfig, logger
+from astrbot.api import AstrBotConfig, llm_tool, logger
 from astrbot.api import message_components as Comp
-from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.provider import LLMResponse
 from astrbot.api.star import Context, Star, StarTools, register
 from astrbot.core.message.message_event_result import ResultContentType
@@ -13,6 +13,7 @@ try:
         detect_markdown_tables,
         parse_markdown_table,
         render_formula_message_to_image_bytes,
+        render_markdown_card_to_image_bytes,
         render_table_to_image_bytes,
         split_text_around_formulas,
         split_text_around_tables,
@@ -26,6 +27,7 @@ except ImportError:  # pragma: no cover - fallback when loaded as top-level modu
         detect_markdown_tables,
         parse_markdown_table,
         render_formula_message_to_image_bytes,
+        render_markdown_card_to_image_bytes,
         render_table_to_image_bytes,
         split_text_around_formulas,
         split_text_around_tables,
@@ -35,9 +37,11 @@ except ImportError:  # pragma: no cover - fallback when loaded as top-level modu
     )
 
 import asyncio
+import json
 import re
 import time
 
+_PLAYWRIGHT_RETRY_COOLDOWN_SEC = 600
 _LIST_ITEM_LINE_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)")
 
 
@@ -65,7 +69,7 @@ def _is_list_context_line(
     "astrbot_plugin_markdown_killer",
     "xkeyC",
     "移除输出中的Markdown格式（保留列表标记换行、支持表格与公式图片渲染）",
-    "0.3.1",
+    "0.4.0",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):
@@ -102,6 +106,8 @@ class MarkdownKillerPlugin(Star):
             )
 
         self._env_manager: EnvManager | None = None
+        self._env_lock = asyncio.Lock()
+        self._playwright_retry_at = 0.0
 
     async def initialize(self) -> None:
         """Called when the plugin is activated. Sets up Playwright env if enabled."""
@@ -134,6 +140,96 @@ class MarkdownKillerPlugin(Star):
             self.enable_table_render = False
             self.enable_formula_render = False
             self._playwright_available = False
+
+    async def _ensure_playwright(self) -> bool:
+        """Lazily prepare Playwright for the card tool when render hooks are off."""
+        if self._env_manager is not None and self._playwright_available:
+            return True
+        async with self._env_lock:
+            # Installation can block for minutes; don't retry on every call.
+            if time.monotonic() < self._playwright_retry_at:
+                return False
+            try:
+                if self._env_manager is None:
+                    data_dir = str(
+                        StarTools.get_data_dir("astrbot_plugin_markdown_killer")
+                    )
+                    self._env_manager = EnvManager(data_dir)
+                if not self._env_manager.is_installed():
+                    await self._env_manager.install_dependencies()
+                if self._env_manager.is_installed():
+                    self._playwright_available = True
+                else:
+                    self._playwright_available = (
+                        await self._env_manager.verify_playwright()
+                    )
+            except Exception as e:
+                logger.error(f"[MarkdownKiller] 准备 Playwright 失败: {e}")
+                self._playwright_available = False
+            if not self._playwright_available:
+                self._playwright_retry_at = (
+                    time.monotonic() + _PLAYWRIGHT_RETRY_COOLDOWN_SEC
+                )
+        return self._playwright_available
+
+    @llm_tool("chat_send_markdown_img_card")
+    async def chat_send_markdown_img_card(
+        self,
+        event: AstrMessageEvent,
+        markdown: str,
+        title: str = "",
+    ) -> str:
+        """把 Markdown 内容渲染成一张图片卡片并立即发送到当前会话。适合排版复杂、结构化或篇幅较长的内容：含表格、LaTeX 公式、多级标题/列表、代码块的回答，对比清单、教程步骤、总结报告等。纯文本聊天无法显示 Markdown，需要保留排版时主动调用本工具。发送成功后不要再用文字重复卡片内容，只需简短补充一句即可。
+
+        Args:
+            markdown(string): 要渲染的完整 Markdown 正文。支持标题、列表、引用、代码块、表格，以及 $...$ 行内公式和 $$...$$ 块级公式（LaTeX 语法）。不渲染 HTML 标签，仅表格单元格内换行可用 <br>。
+            title(string): 可选。卡片顶部标题，留空则不显示标题栏。
+
+        Returns:
+            str: JSON 格式的发送结果。
+        """
+        if not markdown or not markdown.strip():
+            return json.dumps(
+                {"success": False, "error": "markdown 不能为空"}, ensure_ascii=False
+            )
+        if not await self._ensure_playwright():
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": "Playwright 不可用，无法渲染卡片，请改用纯文本回复",
+                },
+                ensure_ascii=False,
+            )
+
+        start_ts = time.perf_counter()
+        image_bytes = await render_markdown_card_to_image_bytes(
+            markdown, title=title, timeout=30000
+        )
+        if not image_bytes:
+            return json.dumps(
+                {"success": False, "error": "卡片渲染失败，请改用纯文本回复"},
+                ensure_ascii=False,
+            )
+
+        try:
+            await event.send(MessageChain([Comp.Image.fromBytes(image_bytes)]))
+        except Exception as e:
+            logger.error(f"[MarkdownKiller] 发送 Markdown 卡片失败: {e}")
+            return json.dumps(
+                {"success": False, "error": f"卡片发送失败: {e}"}, ensure_ascii=False
+            )
+
+        elapsed = time.perf_counter() - start_ts
+        logger.info(
+            f"[MarkdownKiller] 已发送 Markdown 卡片 ({len(markdown)} 字符，耗时 {elapsed:.2f}s)"
+        )
+        return json.dumps(
+            {
+                "success": True,
+                "message": "Markdown 卡片图片已发送给用户，无需再用文字重复其内容。",
+            },
+            ensure_ascii=False,
+        )
 
     async def terminate(self) -> None:
         """Called when the plugin is disabled/reloaded. Closes the browser (best-effort)."""

@@ -45,6 +45,7 @@ from utils.list_processor import remove_list_markers  # noqa: E402
 from utils.formula_renderer import (  # noqa: E402
     build_formula_html,
     build_formula_message_html,
+    build_markdown_card_html,
     contains_latex_formulas,
     split_text_around_formulas,
 )
@@ -223,6 +224,7 @@ def test_list_removal_adaptive_merge():
 def _load_plugin_class_for_tests():
     """Import main.py with minimal AstrBot stubs for newline-cleanup coverage."""
     _astrbot_api_pkg.AstrBotConfig = dict
+    _astrbot_api_pkg.llm_tool = lambda *_args, **_kwargs: (lambda fn: fn)
 
     class _Plain:
         def __init__(self, text=""):
@@ -252,7 +254,12 @@ def _load_plugin_class_for_tests():
         def on_decorating_result(*_args, **_kwargs):
             return lambda fn: fn
 
+    class _MessageChain:
+        def __init__(self, chain=None):
+            self.chain = list(chain or [])
+
     event_pkg.AstrMessageEvent = object
+    event_pkg.MessageChain = _MessageChain
     event_pkg.filter = _Filter
     sys.modules["astrbot.api.event"] = event_pkg
 
@@ -870,7 +877,7 @@ def test_build_formula_html():
         r"\frac{d}{dt}\frac{\partial L}{\partial \dot y}=0", display=True
     )
     assert "<math" in block_html and 'display="block"' in block_html
-    assert "<mfrac>" in block_html and "&#x02202;" in block_html
+    assert "<mfrac>" in block_html and "∂" in block_html
     assert block_html.count('display="block"') == 1
     assert 'class="formula-image display-formula"' in block_html
 
@@ -1035,6 +1042,112 @@ def test_formula_decorating_result_is_image_only():
     )
 
 
+def test_build_markdown_card_html():
+    card = build_markdown_card_html(
+        "## 结论\n\n| a | b |\n|---|---|\n| 1 | $x^2$ |\n\n$$E=mc^2$$\n\n<b>raw</b>",
+        title="标题 <x>",
+    )
+    assert '<div class="md-card-title">标题 &lt;x&gt;</div>' in card
+    assert "<h2>结论</h2>" in card and "<table>" in card
+    assert card.count("<math") == 2 and 'class="display-formula"' in card
+    assert "<b>raw</b>" not in card
+    assert 'class="md-card-canvas"' in card
+
+    plain = build_markdown_card_html("- 一\n- 二")
+    assert "md-card-title" not in plain.split("</style>")[1]
+    assert "<li>一</li>" in plain
+
+    try:
+        build_markdown_card_html("   ")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("empty markdown should be rejected")
+    print("OK  markdown card html: title, tables, formulas, escaped html")
+
+
+def test_markdown_card_security_and_structure():
+    injected = build_markdown_card_html(
+        r'hi $\text{<img/src="x"/onerror="document.title=1337">}$ end'
+    )
+    body = injected.split("</style>")[1]
+    assert "<img" not in body and "&lt;img" in body
+
+    code = build_markdown_card_html("```python\nif a < b && c:\n```\n\n`x<y & z`")
+    assert "if a &lt; b &amp;&amp; c:" in code
+    assert "<code>x&lt;y &amp; z</code>" in code
+    assert "&amp;lt;" not in code
+
+    table = build_markdown_card_html("| a | b |\n|---|---|\n| $$x^2$$ | 2 |\n| 3 | 4 |")
+    assert table.count("<tr>") == 3 and "<math" in table
+    assert 'class="display-formula"' not in table
+
+    listed = build_markdown_card_html("- 一 $$x$$\n- 二")
+    assert listed.count("<li>") == 2
+
+    aligned = build_markdown_card_html(
+        "$$\\begin{aligned} a &= b \\\\ c &= d \\end{aligned}$$\n\n$\\text{a < b}$ 和 $x & y$"
+    )
+    assert "<mtable" in aligned and "aligned" not in aligned.split("</style>")[1]
+    assert aligned.count("<math") == 3
+
+    br = build_markdown_card_html("| a |\n|---|\n| 一<br>二 |\n\n`<br>`")
+    assert "一<br>二" in br and "<code>&lt;br&gt;</code>" in br
+    print("OK  markdown card: MathML sanitized, no double escape, block math in table/list")
+
+
+def test_markdown_card_tool_sends_image():
+    import json
+
+    import main as main_module
+
+    plugin_cls = _load_plugin_class_for_tests()
+    plugin = plugin_cls(None, {})
+    plugin._env_manager = object()
+    plugin._playwright_available = True
+
+    calls = []
+
+    async def fake_render(source, title="", timeout=30000):
+        calls.append((source, title))
+        return b"png"
+
+    class _Event:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, chain):
+            self.sent.append(chain)
+
+    original = main_module.render_markdown_card_to_image_bytes
+    main_module.render_markdown_card_to_image_bytes = fake_render
+    try:
+        event = _Event()
+        result = json.loads(
+            asyncio.run(
+                plugin.chat_send_markdown_img_card(event, "# hi", title="T")
+            )
+        )
+        assert result["success"] is True
+        assert calls == [("# hi", "T")]
+        assert len(event.sent) == 1 and event.sent[0].chain[0].data == b"png"
+
+        empty = json.loads(asyncio.run(plugin.chat_send_markdown_img_card(event, " ")))
+        assert empty["success"] is False and len(event.sent) == 1
+
+        async def failed_render(*_args, **_kwargs):
+            return None
+
+        main_module.render_markdown_card_to_image_bytes = failed_render
+        failed = json.loads(
+            asyncio.run(plugin.chat_send_markdown_img_card(event, "text"))
+        )
+        assert failed["success"] is False and len(event.sent) == 1
+    finally:
+        main_module.render_markdown_card_to_image_bytes = original
+    print("OK  chat_send_markdown_img_card sends one image and reports failures")
+
+
 def main():
     print("=" * 70)
     print("test_list_and_table.py - real-implementation verification")
@@ -1057,6 +1170,9 @@ def main():
     test_build_formula_html()
     test_formula_rendering_chain_and_fallback()
     test_formula_decorating_result_is_image_only()
+    test_build_markdown_card_html()
+    test_markdown_card_security_and_structure()
+    test_markdown_card_tool_sends_image()
     print("=" * 70)
     print("ALL TESTS PASSED")
     print("=" * 70)
