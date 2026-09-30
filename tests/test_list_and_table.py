@@ -224,7 +224,7 @@ def test_list_removal_adaptive_merge():
 def _load_plugin_class_for_tests():
     """Import main.py with minimal AstrBot stubs for newline-cleanup coverage."""
     _astrbot_api_pkg.AstrBotConfig = dict
-    _astrbot_api_pkg.llm_tool = lambda *_args, **_kwargs: (lambda fn: fn)
+    _astrbot_api_pkg.llm_tool = lambda *_args, **_kwargs: lambda fn: fn
 
     class _Plain:
         def __init__(self, text=""):
@@ -327,7 +327,7 @@ def test_remove_markdown_preserves_list_newlines():
     print(f"OK  ordered-main: formatting stripped, list newlines kept -> {actual!r}")
 
     unordered = "- **项目。**\n* [链接](https://example.com)。\n+ ~~删除~~。"
-    unordered_expected = "- 项目。\n* 链接。\n+ 删除。"
+    unordered_expected = "- 项目。\n* 链接(https://example.com)。\n+ 删除。"
     actual = plugin._remove_markdown_no_tables(unordered)
     assert actual == unordered_expected, (
         f"FAIL unordered cleanup: {actual!r} (expected {unordered_expected!r})"
@@ -356,6 +356,40 @@ def test_remove_markdown_preserves_list_newlines():
     print(
         f"OK  paragraph:    non-list segment-boundary cleanup unchanged -> {actual!r}"
     )
+
+
+def test_remove_markdown_keeps_link_urls():
+    """Links become ``text(url)`` and URLs survive emphasis stripping."""
+    plugin = _new_plugin_for_tests()
+    cases = [
+        (
+            "详见[官方文档](https://docs.example.com/a_b_c)。",
+            "详见官方文档(https://docs.example.com/a_b_c)。",
+        ),
+        ("[https://example.com](https://example.com)", "https://example.com"),
+        ("[example.com](https://example.com)", "https://example.com"),
+        ('[标题](https://example.com "tip")', "标题(https://example.com)"),
+        (
+            "[维基](https://en.wikipedia.org/wiki/Foo_(bar))",
+            "维基(https://en.wikipedia.org/wiki/Foo_(bar))",
+        ),
+        ("访问 <https://example.com/x_y_z>", "访问 https://example.com/x_y_z"),
+        ("**https://example.com/_init_/**", "https://example.com/_init_/"),
+        ("见 https://a.com/__x__/*y* 和 *强调*", "见 https://a.com/__x__/*y* 和 强调"),
+        ("![图片](https://example.com/a.png)", "图片"),
+        (
+            "- **项目** [链接](https://e.com/a_b_) 结尾",
+            "- 项目 链接(https://e.com/a_b_) 结尾",
+        ),
+    ]
+    for src, expected in cases:
+        actual = plugin._remove_markdown_no_tables(src)
+        assert actual == expected, (
+            f"FAIL link: {src!r} -> {actual!r} (expected {expected!r})"
+        )
+        again = plugin._remove_markdown_no_tables(actual)
+        assert again == actual, f"FAIL link idempotent: {actual!r} -> {again!r}"
+    print("OK  links:        text(url) kept, URLs untouched by emphasis cleanup")
 
 
 # ---------------------------------------------------------------------------
@@ -1093,7 +1127,9 @@ def test_markdown_card_security_and_structure():
 
     br = build_markdown_card_html("| a |\n|---|\n| 一<br>二 |\n\n`<br>`")
     assert "一<br>二" in br and "<code>&lt;br&gt;</code>" in br
-    print("OK  markdown card: MathML sanitized, no double escape, block math in table/list")
+    print(
+        "OK  markdown card: MathML sanitized, no double escape, block math in table/list"
+    )
 
 
 def test_markdown_card_tool_sends_image():
@@ -1124,9 +1160,7 @@ def test_markdown_card_tool_sends_image():
     try:
         event = _Event()
         result = json.loads(
-            asyncio.run(
-                plugin.chat_send_markdown_img_card(event, "# hi", title="T")
-            )
+            asyncio.run(plugin.chat_send_markdown_img_card(event, "# hi", title="T"))
         )
         assert result["success"] is True
         assert calls == [("# hi", "T")]
@@ -1156,6 +1190,7 @@ def main():
     test_list_removal_idempotent()
     test_list_removal_adaptive_merge()
     test_remove_markdown_preserves_list_newlines()
+    test_remove_markdown_keeps_link_urls()
     test_table_detection()
     test_table_parse()
     test_split_text_around_tables()

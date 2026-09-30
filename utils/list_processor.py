@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import re
 
+from .link_processor import convert_markdown_links, protect_urls
+
 # Module-level pre-compiled regexes — avoid recompiling per call (N6).
 _LIST_ITEM_RE = re.compile(r"^(\s*)((?:[-*+])|(?:\d+[.)]))(\s+)(.*?)(\s*)$")
 _INDENTED_RE = re.compile(r"^(\s+)(.*?)(\s*)$")
@@ -18,8 +20,7 @@ _INDENTED_RE = re.compile(r"^(\s+)(.*?)(\s*)$")
 def _strip_inline_markdown(text: str) -> str:
     """Remove inline Markdown formatting from list-item content only."""
     text = re.sub(r"`([^`]+)`", r"\1", text)
-    text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
-    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+    text, restore_urls = protect_urls(convert_markdown_links(text))
     text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
     text = re.sub(r"__(.*?)__", r"\1", text)
     text = re.sub(
@@ -33,7 +34,7 @@ def _strip_inline_markdown(text: str) -> str:
         text,
     )
     text = re.sub(r"~~(.*?)~~", r"\1", text)
-    return text
+    return restore_urls(text)
 
 
 def remove_list_markers(text: str, merge_threshold: int = 30) -> str:

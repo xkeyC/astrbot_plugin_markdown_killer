@@ -18,6 +18,7 @@ try:
         split_text_around_formulas,
         split_text_around_tables,
     )
+    from .utils.link_processor import convert_markdown_links, protect_urls
     from .utils.list_processor import remove_list_markers as _remove_list_markers_impl
 except ImportError:  # pragma: no cover - fallback when loaded as top-level module
     from utils import (  # type: ignore
@@ -32,6 +33,7 @@ except ImportError:  # pragma: no cover - fallback when loaded as top-level modu
         split_text_around_formulas,
         split_text_around_tables,
     )
+    from utils.link_processor import convert_markdown_links, protect_urls  # type: ignore
     from utils.list_processor import (  # type: ignore
         remove_list_markers as _remove_list_markers_impl,
     )
@@ -784,11 +786,11 @@ class MarkdownKillerPlugin(Star):
         # 移除行内代码 `code` -> code
         text = re.sub(r"`([^`]+)`", r"\1", text)
 
-        # 移除图片 ![alt](url) -> alt (提前于普通链接处理避免残留 "!")
-        text = re.sub(r"!\[([^\]]*)\]\([^)]+\)", r"\1", text)
+        # 图片 ![alt](url) -> alt；链接 [text](url) -> text(url)，<url> -> url
+        text = convert_markdown_links(text)
 
-        # 移除普通链接 [text](url) -> text
-        text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)
+        # URL 用占位符保护，避免 _ / * / ~ 被下方强调规则误删
+        text, restore_urls = protect_urls(text)
 
         # 移除粗体 - 使用非贪婪匹配以支持内部包含特殊符号的情况
         text = re.sub(r"\*\*(.*?)\*\*", r"\1", text)
@@ -808,7 +810,7 @@ class MarkdownKillerPlugin(Star):
         text = re.sub(r"^(?:>\s*)+(.*)", r"\1", text, flags=re.MULTILINE)
 
         # 保留列表标记与列表项换行，仅清理列表项内容中的行内 Markdown 格式
-        text = self._remove_list_markers(text)
+        text = restore_urls(self._remove_list_markers(text))
 
         # Remove extra newlines if enabled
         if self.remove_extra_newlines:
