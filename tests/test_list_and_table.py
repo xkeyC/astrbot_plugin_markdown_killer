@@ -392,6 +392,19 @@ def test_remove_markdown_keeps_link_urls():
     print("OK  links:        text(url) kept, URLs untouched by emphasis cleanup")
 
 
+def test_remove_markdown_strips_leaked_citations():
+    """Leaked citation markup is removed before markdown cleanup."""
+    plugin = _new_plugin_for_tests()
+    ref = chr(0xE200) + "cite" + chr(0xE202) + "turn0search6" + chr(0xE201)
+    src = (
+        f"**优势**明显。{ref} 5. 没必要。citeturn2search0turn2search1\n"
+        '::git-push{cwd="/repo" branch="main"}'
+    )
+    actual = plugin.remove_markdown(src)
+    assert actual == "优势明显。 5. 没必要。", f"FAIL citations: {actual!r}"
+    print("OK  citations:    leaked citation markup stripped")
+
+
 # ---------------------------------------------------------------------------
 # Tests — table detection / parsing / splitting / HTML (real imports).
 # ---------------------------------------------------------------------------
@@ -1191,6 +1204,7 @@ def main():
     test_list_removal_adaptive_merge()
     test_remove_markdown_preserves_list_newlines()
     test_remove_markdown_keeps_link_urls()
+    test_remove_markdown_strips_leaked_citations()
     test_table_detection()
     test_table_parse()
     test_split_text_around_tables()

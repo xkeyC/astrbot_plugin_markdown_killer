@@ -19,6 +19,7 @@ try:
         split_text_around_tables,
     )
     from .utils.link_processor import convert_markdown_links, protect_urls
+    from .utils.model_markup import strip_model_markup
     from .utils.list_processor import remove_list_markers as _remove_list_markers_impl
 except ImportError:  # pragma: no cover - fallback when loaded as top-level module
     from utils import (  # type: ignore
@@ -34,6 +35,7 @@ except ImportError:  # pragma: no cover - fallback when loaded as top-level modu
         split_text_around_tables,
     )
     from utils.link_processor import convert_markdown_links, protect_urls  # type: ignore
+    from utils.model_markup import strip_model_markup  # type: ignore
     from utils.list_processor import (  # type: ignore
         remove_list_markers as _remove_list_markers_impl,
     )
@@ -262,6 +264,12 @@ class MarkdownKillerPlugin(Star):
             return
 
         original_text = resp.completion_text
+        # 模型泄漏的引用标记（citeturn0search1、::git-push{...} 等）无论如何都要清掉
+        stripped_text = strip_model_markup(original_text)
+        if stripped_text != original_text:
+            resp.completion_text = stripped_text
+            self._log_cleaned_text(original_text, stripped_text, source="[引用标记]")
+            original_text = stripped_text
         if (
             self.enable_formula_render
             and self._playwright_available
@@ -762,7 +770,7 @@ class MarkdownKillerPlugin(Star):
         ``| 功能 |`` 紧贴前文，表格不再被检测到（静默失败）。此处改为智能
         拼接：保证每个表格块均以行首开始、以换行结束。
         """
-        blocks = self._split_table_blocks(text)
+        blocks = self._split_table_blocks(strip_model_markup(text))
         result = ""
         for block, is_table in blocks:
             if is_table:
