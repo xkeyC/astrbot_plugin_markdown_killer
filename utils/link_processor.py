@@ -1,6 +1,6 @@
 """Pure-stdlib Markdown link handling — importable from main.py and tests.
 
-Links are flattened to ``描述文本(url)`` instead of dropping the URL, and URLs
+Links are flattened to ``描述文本( url )`` instead of dropping the URL, and URLs
 are shielded from the emphasis-stripping regexes (``_`` / ``*`` / ``~`` inside
 a URL must survive untouched).
 """
@@ -41,11 +41,11 @@ def _format_link(label: str, url: str) -> str:
     label = label.strip()
     if not label or label == url or label == _strip_scheme(url):
         return url
-    return f"{label}({url})"
+    return f"{label}( {url} )"
 
 
 def convert_markdown_links(text: str) -> str:
-    """``[text](url)`` -> ``text(url)``; ``<url>`` -> ``url``; images -> alt text.
+    """``[text](url)`` -> ``text( url )``; ``<url>`` -> ``url``; images -> alt text.
 
     When the label is empty or is the URL itself, only the URL is kept.
     """

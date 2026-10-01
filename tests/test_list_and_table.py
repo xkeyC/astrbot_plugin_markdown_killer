@@ -327,7 +327,7 @@ def test_remove_markdown_preserves_list_newlines():
     print(f"OK  ordered-main: formatting stripped, list newlines kept -> {actual!r}")
 
     unordered = "- **项目。**\n* [链接](https://example.com)。\n+ ~~删除~~。"
-    unordered_expected = "- 项目。\n* 链接(https://example.com)。\n+ 删除。"
+    unordered_expected = "- 项目。\n* 链接( https://example.com )。\n+ 删除。"
     actual = plugin._remove_markdown_no_tables(unordered)
     assert actual == unordered_expected, (
         f"FAIL unordered cleanup: {actual!r} (expected {unordered_expected!r})"
@@ -364,14 +364,14 @@ def test_remove_markdown_keeps_link_urls():
     cases = [
         (
             "详见[官方文档](https://docs.example.com/a_b_c)。",
-            "详见官方文档(https://docs.example.com/a_b_c)。",
+            "详见官方文档( https://docs.example.com/a_b_c )。",
         ),
         ("[https://example.com](https://example.com)", "https://example.com"),
         ("[example.com](https://example.com)", "https://example.com"),
-        ('[标题](https://example.com "tip")', "标题(https://example.com)"),
+        ('[标题](https://example.com "tip")', "标题( https://example.com )"),
         (
             "[维基](https://en.wikipedia.org/wiki/Foo_(bar))",
-            "维基(https://en.wikipedia.org/wiki/Foo_(bar))",
+            "维基( https://en.wikipedia.org/wiki/Foo_(bar) )",
         ),
         ("访问 <https://example.com/x_y_z>", "访问 https://example.com/x_y_z"),
         ("**https://example.com/_init_/**", "https://example.com/_init_/"),
@@ -379,7 +379,7 @@ def test_remove_markdown_keeps_link_urls():
         ("![图片](https://example.com/a.png)", "图片"),
         (
             "- **项目** [链接](https://e.com/a_b_) 结尾",
-            "- 项目 链接(https://e.com/a_b_) 结尾",
+            "- 项目 链接( https://e.com/a_b_ ) 结尾",
         ),
     ]
     for src, expected in cases:
