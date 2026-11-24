@@ -306,7 +306,6 @@ def _new_plugin_for_tests():
     plugin_cls = _load_plugin_class_for_tests()
     plugin = plugin_cls.__new__(plugin_cls)
     plugin.remove_extra_newlines = True
-    plugin.newline_mode = "segment_boundary"
     plugin.list_merge_char_threshold = 30
     plugin.enable_formula_render = True
     plugin.formula_render_fallback = "raw"
@@ -341,21 +340,27 @@ def test_remove_markdown_preserves_list_newlines():
     )
     print("OK  list-cont:    indented continuation line breaks kept")
 
-    non_list_indented = "第一句。\n  缩进句。"
-    actual = plugin._remove_markdown_no_tables(non_list_indented)
-    assert actual == "第一句。  缩进句。", (
-        f"FAIL non-list indented cleanup: unexpected preservation: {actual!r}"
-    )
-    print(f"OK  non-list-ind: segment-boundary cleanup still applies -> {actual!r}")
+    cases = [
+        ("第一句。\n  缩进句。", "第一句。\n  缩进句。"),
+        ("第一句。\n第二句！\n第三句~\n第四句…\n第五句？", None),
+        ("第一句。\n\n第二句。", None),
+        ("第一句。\n\n\n\n第二句。  \n", "第一句。\n\n第二句。"),
+        ("\n\n开头。\n结尾。\n\n", "开头。\n结尾。"),
+    ]
+    for text, expected in cases:
+        expected = text if expected is None else expected
+        actual = plugin._remove_markdown_no_tables(text)
+        assert actual == expected, (
+            f"FAIL newline keep: {text!r} -> {actual!r} (expected {expected!r})"
+        )
+    print("OK  newlines:     newlines after 。？！~… kept, blank runs compressed")
 
-    paragraph = "第一句。\n\n第二句。"
-    actual = plugin._remove_markdown_no_tables(paragraph)
-    assert actual == "第一句。第二句。", (
-        f"FAIL paragraph cleanup: non-list newline behavior changed: {actual!r}"
+    plugin.newline_mode = "segment_boundary"  # deprecated legacy config value
+    actual = plugin._remove_markdown_no_tables("第一句。\n第二句。")
+    assert actual == "第一句。\n第二句。", (
+        f"FAIL legacy newline_mode still swallows newlines: {actual!r}"
     )
-    print(
-        f"OK  paragraph:    non-list segment-boundary cleanup unchanged -> {actual!r}"
-    )
+    print("OK  legacy-mode:  deprecated segment_boundary config is ignored")
 
 
 def test_remove_markdown_keeps_link_urls():
@@ -1080,7 +1085,9 @@ def test_formula_decorating_result_is_image_only():
 
         non_formula = _Response("上一集的结尾已经结束。\n\n第3集：普通消息")
         asyncio.run(plugin.on_llm_resp(None, non_formula))
-        assert non_formula.completion_text == "上一集的结尾已经结束。第3集：普通消息"
+        assert (
+            non_formula.completion_text == "上一集的结尾已经结束。\n\n第3集：普通消息"
+        )
     finally:
         renderer_globals["render_formula_message_to_image_bytes"] = original_renderer
 

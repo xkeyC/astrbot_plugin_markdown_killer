@@ -46,34 +46,13 @@ import re
 import time
 
 _PLAYWRIGHT_RETRY_COOLDOWN_SEC = 600
-_LIST_ITEM_LINE_RE = re.compile(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)")
-
-
-def _is_list_context_line(
-    line: str, active_list_indent: int | None
-) -> tuple[bool, int | None]:
-    """Return whether ``line`` belongs to a Markdown list block.
-
-    Besides explicit marker lines, indented non-blank lines after a list marker
-    are Markdown list continuations and must keep their physical line breaks.
-    """
-    marker_match = _LIST_ITEM_LINE_RE.match(line)
-    if marker_match:
-        return True, len(line) - len(line.lstrip())
-
-    if active_list_indent is not None and line.strip():
-        indent = len(line) - len(line.lstrip())
-        if indent > active_list_indent:
-            return True, active_list_indent
-
-    return False, None
 
 
 @register(
     "astrbot_plugin_markdown_killer",
     "xkeyC",
     "移除输出中的Markdown格式（保留列表标记换行、支持表格与公式图片渲染）",
-    "0.4.0",
+    "0.4.1",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):
@@ -81,7 +60,6 @@ class MarkdownKillerPlugin(Star):
         super().__init__(context)
         self.config = config or {}
         self.remove_extra_newlines = self._config_get("remove_extra_newlines", True)
-        self.newline_mode = self._config_get("newline_mode", "segment_boundary")
         self.list_merge_char_threshold = self._coerce_int(
             self._config_get("list_merge_char_threshold", 30), default=30
         )
@@ -652,61 +630,6 @@ class MarkdownKillerPlugin(Star):
         )
         logger.warning(log_msg)
 
-    def _remove_extra_newlines_segment_boundary(self, text: str) -> str:
-        """
-        Remove newlines after segment boundaries (punctuation marks).
-
-        AstrBot segments messages at punctuation marks (。？！~…).
-        Newlines immediately after punctuation become the START of the next
-        segment, appearing as leading blank lines when sent.
-
-        Example:
-            Original: "第一句。\n\n第二句。"
-            After split: ["第一句。", "\n\n第二句。"]
-            Result: Extra blank lines before "第二句。"
-
-        Solution: Remove newlines right after segment punctuation, except when
-        either side of the newline belongs to a Markdown list block. This
-        includes explicit marker lines and indented continuation/wrapped lines.
-        """
-        parts = re.split(r"(\n+)", text)
-        if len(parts) == 1:
-            return text.strip()
-
-        lines = parts[::2]
-        list_context_lines: list[bool] = []
-        active_list_indent: int | None = None
-        for line in lines:
-            is_list_context, active_list_indent = _is_list_context_line(
-                line, active_list_indent
-            )
-            list_context_lines.append(is_list_context)
-
-        result: list[str] = [parts[0]]
-        for index in range(1, len(parts), 2):
-            newlines = parts[index]
-            next_text = parts[index + 1] if index + 1 < len(parts) else ""
-            prev_line = result[-1].split("\n")[-1] if result else ""
-            line_index = index // 2
-            prev_is_list_context = list_context_lines[line_index]
-            next_is_list_context = (
-                list_context_lines[line_index + 1]
-                if line_index + 1 < len(list_context_lines)
-                else False
-            )
-
-            if (
-                prev_line.rstrip().endswith(("。", "？", "！", "~", "…"))
-                and not prev_is_list_context
-                and not next_is_list_context
-            ):
-                result.append(next_text)
-            else:
-                result.append(newlines)
-                result.append(next_text)
-
-        return "".join(result).strip()
-
     def _remove_extra_newlines_global(self, text: str) -> str:
         """
         Compress consecutive newlines globally.
@@ -820,11 +743,10 @@ class MarkdownKillerPlugin(Star):
         # 保留列表标记与列表项换行，仅清理列表项内容中的行内 Markdown 格式
         text = restore_urls(self._remove_list_markers(text))
 
-        # Remove extra newlines if enabled
+        # 压缩连续空行（保留单个换行与段落空行）。旧的 segment_boundary 模式会删除
+        # 分段标点后的换行，用于规避 AstrBot 早期分段回复把换行留在下一段开头的
+        # 问题；AstrBot 现已对每段 strip()，该模式会把模型的正常换行吞掉，已废弃。
         if self.remove_extra_newlines:
-            if self.newline_mode == "global":
-                text = self._remove_extra_newlines_global(text)
-            else:
-                text = self._remove_extra_newlines_segment_boundary(text)
+            text = self._remove_extra_newlines_global(text)
 
         return text

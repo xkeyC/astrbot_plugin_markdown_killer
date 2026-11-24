@@ -6,16 +6,16 @@
         "hint": "开启后，将从所有即将发送的最终文本消息中移除 Markdown 格式（而不仅限于 LLM 直接输出的内容）。若同时关闭此项与表格图片渲染，表格将以原始 Markdown 语法保留在文本中（不被清理）。"
     },
     "remove_extra_newlines": {
-        "description": "移除多余的换行符",
+        "description": "压缩多余的空行",
         "type": "bool",
         "default": true,
-        "hint": "启用后，将移除文本中多余的换行，避免分段发送时出现过多空行"
+        "hint": "启用后，连续多个空行压缩为一个空行，并去掉行尾空白；单个换行与段落空行始终保留"
     },
     "newline_mode": {
-        "description": "换行处理模式",
+        "description": "换行处理模式（已废弃）",
         "type": "string",
-        "default": "segment_boundary",
-        "hint": "segment_boundary: 只移除分段标点后的换行（推荐）；global: 全局压缩连续空行",
+        "default": "global",
+        "hint": "已废弃，仅为兼容旧配置保留。现在始终保留换行，只压缩连续空行；旧的 segment_boundary（删除分段标点后的换行）已移除",
         "options": [
             "segment_boundary",
             "global"
