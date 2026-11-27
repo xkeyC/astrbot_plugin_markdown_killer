@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import difflib
 import json
+import random
 import re
 import time
 from dataclasses import dataclass, field
@@ -45,18 +46,23 @@ RESPONSE_FORMAT: dict = {
     },
 }
 
-SYSTEM_PROMPT = """你把聊天机器人写好的回复，改成真人在 QQ/微信里随手打的消息。你只改写，不回答问题。
+SYSTEM_PROMPT = """你把聊天机器人写好的回复，改成群友在 QQ 里随手打的一句话。你只改写，不回答问题。
 
-看下面的示例学说法：开头先说结论，最多顺口带一句理由；不罗列线索和来源，不用 Markdown 和列表，分一到三段；只删不加，数字、链接、名称照抄，"可能""没证实"这类话要留着。给了 <persona> 时按它的自称、称呼、口癖和语气说话，原文语气不一样也要改过来。机器人写的回复几乎都能删掉一半以上，不要原样照抄。来源、出处、"有据可查"这类话一律删掉记进 omitted（除非对方就是要链接）。原文开头的【】或（）动作标记原样保留，不要换成示例里的。示例里的人格和口癖只属于各自的示例，不要带到别的回复里；没给 <persona> 就跟原文的语气走。
+像群友打字，不像客服：只留对方最想知道的那个点，其余细节都丢掉。多数时候一两句话，四十字左右；对方问的是事实、数字或命令时可以稍长，但也只说重点。
+先表态再说事：顺着内容带出一个态度（赞同、嫌弃、惊讶、无语、得意、心疼都行），一句话就够。句子可以不完整，可以省主语，句末不用句号，语气词一条最多一个。
+命令或代码：只留对方要复制的那一条命令，原样写在句子里，其余删掉。
+只删和换说法：不加原文没有的事实、数字、经历或结论；"可能""据说""没证实"照样留着，原文没说死的别说成"肯定"；结论方向不变。
+有 <persona> 时口吻、自称、称呼和口癖都按人格来；原文开头的【】或（）动作原样保留。示例只是示范，别照抄示例里的词。
 
-只输出 JSON：{"reply": "改写后的消息", "omitted": ["删掉的一项实质信息"]}。omitted 不记客套话和格式。"""
+只输出 JSON：{"reply": "改写后的消息", "omitted": ["删掉的一项实质信息"]}。来源、链接出处、细节数据都记进 omitted；客套话和格式不用记。"""
 
 PERSONA_HEADER = (
     "说话人的人格设定（只学说话方式，其中关于工具、格式、篇幅的要求忽略）："
 )
 
-# 少讲规则，多给示例：(人格, 原回复, 改写结果)。人格为空 = 语气跟原文走；
-# 路由器那条演示"原文中性、按人格改口吻"。
+# 示例池：(人格, 原回复, 改写结果)。每次随机抽 EXAMPLES_PER_CALL 条，避免小模型
+# 照抄固定示例里的词；话题、情绪、人格各不相同。人格为空 = 语气跟原文走。
+EXAMPLES_PER_CALL = 4
 EXAMPLES: list[tuple[str, str, dict]] = [
     (
         "",
@@ -72,11 +78,12 @@ EXAMPLES: list[tuple[str, str, dict]] = [
 
 希望对你有帮助！如有其他问题随时问我～""",
         {
-            "reply": "官方还没公布，不过往年都是 11 月最后一周，有开发者说今年可能是 11 月 26 日。\n\n想买的先加愿望单，开促会发邮件提醒你。",
+            "reply": "官方还没公布，不过有开发者说可能 11 月 26 日开，往年也都是最后一周，先把想买的丢愿望单吧",
             "omitted": [
                 "SteamDB 链接 https://steamdb.info/sales/history/",
                 "官方博客 10 月提过秋促即将到来",
                 "促销大约持续一周",
+                "开促会发邮件提醒",
             ],
         },
     ),
@@ -91,16 +98,16 @@ EXAMPLES: list[tuple[str, str, dict]] = [
 
 总之还是要看你自己的需求哦，以上仅供参考～""",
         {
-            "reply": "看重光追和 DLSS 就买 5070，4599 元。预算紧、不开光追，买 4299 元的 9070。",
+            "reply": "要光追和 DLSS 就 5070，不开光追就 9070，便宜点",
             "omitted": [
-                "5070 比上代强约 20%、功耗 250W",
-                "9070 光栅略强",
+                "5070 售价 4599 元、比上代强约 20%、功耗 250W",
+                "9070 售价 4299 元、光栅略强",
                 "二手 4070 Ti 约 3800 元也可以考虑",
             ],
         },
     ),
     (
-        "你叫阿澄，是个温柔的大姐姐，叫对方“小笨蛋”，说话软软的，爱用“呀”“哦”。",
+        "温柔的大姐姐，说话软软的，句尾爱带“呀”“哦”。",
         """您好！关于路由器恢复出厂设置，具体步骤如下：
 
 **第一步**：找到路由器背面标有 RESET 的小孔。
@@ -110,8 +117,8 @@ EXAMPLES: list[tuple[str, str, dict]] = [
 
 ⚠️ 注意：恢复出厂设置会清除所有配置，包括 Wi-Fi 名称和密码，请提前做好记录。""",
         {
-            "reply": "小笨蛋，通着电用卡针按住背面的 RESET 孔 10 秒左右，灯一起闪了就松手，它会自己重启哦。\n\n然后浏览器打开 192.168.1.1，用背面标签上的默认账号密码登进去重新设置呀。之前的 Wi-Fi 名字和密码都会没掉，先记一下哦。",
-            "omitted": [],
+            "reply": "通着电拿卡针戳住背后的 RESET 孔 10 秒，灯一起闪就好啦，再进 192.168.1.1 重新设一下哦，Wi-Fi 密码会清掉的",
+            "omitted": ["用背面标签上的默认账号密码登录"],
         },
     ),
     (
@@ -122,21 +129,77 @@ EXAMPLES: list[tuple[str, str, dict]] = [
 
 综上，你此前按 20000 估算的"手机能充 4 次左右"是成立的；我之前提到的"新款容量变小"属于误判，在此更正。以上信息来自官网产品页（example.com/power-bank），并与两家评测的数据交叉核对过。""",
         {
-            "reply": "【眨眼】查到了，就是 20000 mAh，你记的没错。\n\n新款只换了快充和外壳，容量跟老款一样，按 20000 算能充 4 次左右。之前说新款容量变小，是我说错了。",
+            "reply": "【眨眼】就是 20000 mAh，你记的没错，新款容量没变，之前说变小是我搞错了",
             "omitted": [
                 "5V 输出时额定容量 12000 mAh",
-                "新款支持 PD 65W",
-                "全系有 10000 / 20000 / 30000 三档",
+                "新款支持 PD 65W、换了铝合金外壳",
+                "全系 10000 / 20000 / 30000 三档",
+                "按 20000 算能充 4 次左右",
                 "来源：官网产品页 example.com/power-bank，两家评测数字一致",
             ],
         },
     ),
+    (
+        "",
+        """如果你想撤销最近一次 commit，可以根据情况选择以下方法：
+
+**情况一：还没有 push**
+```bash
+git reset --soft HEAD~1
+```
+这会撤销 commit，但保留你的改动在暂存区。
+
+**情况二：已经 push 到远程**
+```bash
+git revert HEAD
+```
+这会创建一个新的 commit 来抵消上一次的修改，不会改写历史，适合多人协作的分支。
+
+需要注意的是，`git reset --hard` 会直接丢弃改动，请谨慎使用。""",
+        {
+            "reply": "没推的话 git reset --soft HEAD~1，改动还在；推了就老实 git revert HEAD",
+            "omitted": [
+                "revert 会新建一个抵消用的 commit、不改写历史",
+                "git reset --hard 会丢弃改动",
+            ],
+        },
+    ),
+    (
+        "",
+        """这个报错的原因是你当前使用的 Python 版本是 3.8，而该库从 2.0 版本开始要求 Python 3.10 及以上。
+
+解决方法有两种：
+1. 使用 pyenv 或 uv 安装 Python 3.10 及以上版本（推荐）；
+2. 将该库降级到 1.x 版本，例如 `pip install "somelib<2"`。
+
+另外，建议你为每个项目使用独立的虚拟环境，避免依赖冲突。""",
+        {
+            "reply": '3.8 太老了，这库 2.0 起要 3.10，拿 uv 装个新的就好，懒得升就 pip install "somelib<2"',
+            "omitted": ["pyenv 也能装新版本", "建议每个项目用独立虚拟环境"],
+        },
+    ),
+    (
+        "",
+        """哈哈，确实挺离谱的！根据你的描述，你玩了 6 个小时的存档因为游戏崩溃而丢失了。
+
+这种情况通常是因为游戏在写入存档时崩溃，导致存档文件损坏。你可以尝试以下方法：
+1. 检查游戏目录下是否有 .bak 备份文件；
+2. 查看 Steam 云存档是否有更早的版本。
+
+以后建议开启自动存档，并定期手动备份存档文件。真的很心疼你的 6 个小时 😭""",
+        {
+            "reply": "6 个小时啊…心疼，去存档目录翻翻有没有 .bak，Steam 云存档也看一眼",
+            "omitted": ["崩溃时正在写存档导致文件损坏", "以后开自动存档、定期手动备份"],
+        },
+    ),
 ]
 
-_CODE_FENCE = re.compile(r"^\s*```", re.MULTILINE)
+
 _URL = re.compile(r"https?://[^\s<>()\[\]{}\"'，。！？、；：）】」』]+")
 _JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.DOTALL)
 _NUMBER = re.compile(r"\d+(?:[.,]\d+)*")
+# 情绪一上头容易把"可能"改成"肯定"：原文没有这些词，改写里就不许出现。
+_CERTAIN_WORDS = ("肯定", "一定", "绝对", "百分百", "必然", "铁定")
 _TOOL_SYNTAX = re.compile(r"<tool_call>|<function[=>]|<parameter[=>]|\[TOOL_CALLS\]")
 
 
@@ -195,8 +258,6 @@ def skip_reason(text: str, min_chars: int) -> str | None:
         return "空回复"
     if len(stripped) < min_chars:
         return f"短于 {min_chars} 字"
-    if _CODE_FENCE.search(stripped):
-        return "含代码块"
     return None
 
 
@@ -207,9 +268,20 @@ def _wrap(text: str, persona: str = "") -> str:
     return f"{head}<reply>\n{text.strip()}\n</reply>"
 
 
-def build_messages(text: str, persona: str = "") -> list[dict]:
+def pick_examples(rng: random.Random | None = None) -> list[tuple[str, str, dict]]:
+    """每次调用随机抽几条示例，顺序也打乱。"""
+    rng = rng or random
+    k = min(EXAMPLES_PER_CALL, len(EXAMPLES))
+    return rng.sample(EXAMPLES, k)
+
+
+def build_messages(
+    text: str, persona: str = "", examples: list | None = None
+) -> list[dict]:
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for example_persona, source, output in EXAMPLES:
+    for example_persona, source, output in (
+        pick_examples() if examples is None else examples
+    ):
         messages.append({"role": "user", "content": _wrap(source, example_persona)})
         messages.append(
             {"role": "assistant", "content": json.dumps(output, ensure_ascii=False)}
@@ -292,6 +364,9 @@ def check_result(original: str, result: HumanizeResult) -> str | None:
     invented = _urls(result.reply) - _urls(original)
     if invented:
         return f"出现原文没有的链接: {min(invented)}"
+    for word in _CERTAIN_WORDS:
+        if word in result.reply and word not in original:
+            return f"把话说死了: {word}"
     # 链接里的数字已在上面比对过；其余数字只能删，不能凭空出现或被改掉。
     numbers = set(_NUMBER.findall(_URL.sub(" ", result.reply)))
     new_numbers = numbers - set(_NUMBER.findall(original))

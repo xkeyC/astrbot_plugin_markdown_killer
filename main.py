@@ -59,7 +59,7 @@ _PERSONA_EXTRA = "_markdown_killer_persona"
     "astrbot_plugin_markdown_killer",
     "xkeyC",
     "移除输出中的Markdown格式（保留列表标记换行、支持表格与公式图片渲染）",
-    "0.5.3",
+    "0.6.0",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):

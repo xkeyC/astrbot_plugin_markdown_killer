@@ -55,6 +55,7 @@ def test_check_result():
     assert "链接" in humanizer.check_result(LONG, R("看 https://evil.example/x", []))
     assert "数字" in humanizer.check_result(LONG, R("报错码是 504", []))
     assert "工具" in humanizer.check_result(LONG, R("<tool_call>x", []))
+    assert "说死" in humanizer.check_result(LONG, R("肯定是缓存的问题", []))
     # 链接原样保留、只删数字都可以
     assert humanizer.check_result(LONG, R("文档在 https://example.com/doc", [])) is None
     print("OK  check_result rejects longer/new URL/new number/tool syntax")
@@ -62,7 +63,8 @@ def test_check_result():
 
 def test_skip_and_payload():
     assert humanizer.skip_reason("好的", 80)
-    assert humanizer.skip_reason("x" * 100 + "\n```py\nprint(1)\n```", 80) == "含代码块"
+    # 代码块不再跳过：也交给模型尽量简化
+    assert humanizer.skip_reason("x" * 100 + "\n```py\nprint(1)\n```", 80) is None
     assert humanizer.skip_reason(LONG, 20) is None
     assert humanizer.parse_extra_body(None) == humanizer.DEFAULT_EXTRA_BODY
     assert humanizer.parse_extra_body("") == {}
@@ -431,7 +433,14 @@ def test_prompt_examples_and_persona():
     msgs = humanizer.build_messages(LONG, persona="自称本喵")
     assert msgs[0]["role"] == "system"
     assert "<persona>\n自称本喵\n</persona>" in msgs[-1]["content"]
-    assert len(msgs) == 2 + 2 * len(humanizer.EXAMPLES)
+    assert len(msgs) == 2 + 2 * humanizer.EXAMPLES_PER_CALL
+    # 示例每次随机抽，不重复
+    import random
+
+    picked = humanizer.pick_examples(random.Random(1))
+    assert len(picked) == humanizer.EXAMPLES_PER_CALL
+    assert len({id(x) for x in picked}) == len(picked)
+    assert len(humanizer.EXAMPLES) > humanizer.EXAMPLES_PER_CALL
     assert msgs[-1]["content"].endswith("<reply>\n" + LONG.strip() + "\n</reply>")
     assert "<persona>" not in humanizer.build_messages(LONG)[-1]["content"]
     # 示例本身要过得了校验，否则是在教模型犯规
