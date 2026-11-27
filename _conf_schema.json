@@ -60,5 +60,71 @@
             "text",
             "remove"
         ]
+    },
+    "enable_humanize": {
+        "description": "拟人模式",
+        "type": "bool",
+        "default": false,
+        "hint": "独立开关。开启后 LLM 的最终回复不再按规则清洗 Markdown，而是交给下面配置的模型改写成真人发消息的样子：简洁、分几段、不用 Markdown、不罗列线索，只简化最终发到 IM 的内容。回复太短、含代码块或图片、改写失败或校验不通过时，回退到普通清洗。流式输出时无法改写。"
+    },
+    "humanize_base_url": {
+        "description": "拟人模式：模型地址",
+        "type": "string",
+        "default": "",
+        "hint": "OpenAI 兼容接口的 base URL，例如 http://192.168.6.116:8731/v1（会自动拼上 /chat/completions）。留空则拟人模式不生效。"
+    },
+    "humanize_api_key": {
+        "description": "拟人模式：API Key",
+        "type": "string",
+        "default": "",
+        "hint": "本地模型不需要可留空。"
+    },
+    "humanize_model": {
+        "description": "拟人模式：模型名",
+        "type": "string",
+        "default": "",
+        "hint": "例如 halogen-qwen3.8-flash-next。"
+    },
+    "humanize_extra_body": {
+        "description": "拟人模式：额外请求体（JSON）",
+        "type": "text",
+        "default": "{\"prompt_cache_policy\": \"no_store\", \"chat_template_kwargs\": {\"enable_thinking\": false}}",
+        "hint": "合并进请求体的顶层字段。默认值针对 halogen：prompt_cache_policy=no_store 让这次一次性调用照常读前缀缓存，但不新建缓存条目、不写 SSD 缓存、不挤掉真实对话的缓存；enable_thinking=false 关闭思考。其他服务端不认识这些字段时可清空。"
+    },
+    "humanize_temperature": {
+        "description": "拟人模式：温度",
+        "type": "float",
+        "default": 0.7,
+        "hint": "填负数则不传温度，由服务端决定。"
+    },
+    "humanize_timeout": {
+        "description": "拟人模式：超时（秒）",
+        "type": "int",
+        "default": 20,
+        "hint": "超时就回退到普通清洗，原回复照常发出。"
+    },
+    "humanize_min_chars": {
+        "description": "拟人模式：最短改写字数",
+        "type": "int",
+        "default": 80,
+        "hint": "短于这个字数的回复不改写，只做普通清洗。"
+    },
+    "humanize_use_persona": {
+        "description": "拟人模式：遵守当前人格",
+        "type": "bool",
+        "default": true,
+        "hint": "把本会话当前生效的人格提示词和示例对话交给改写模型，让它沿用人格的自称、称呼、口癖和语气（只学说话方式，人格里的其他指令忽略）。"
+    },
+    "humanize_persona_max_chars": {
+        "description": "拟人模式：人格设定最多带多少字",
+        "type": "int",
+        "default": 3000,
+        "hint": "人格提示词和示例对话合计超过这个字数时截断，0 表示不截断。"
+    },
+    "humanize_notify_agent": {
+        "description": "拟人模式：告知 agent 被简化的内容",
+        "type": "bool",
+        "default": true,
+        "hint": "改写后记下用户实际看到的内容和被省略的要点，在该会话下一次请求时以 user 身份的系统提醒带入（只写入标记，不会单独触发 LLM）。插件重启会丢掉还没带入的提醒。"
     }
 }

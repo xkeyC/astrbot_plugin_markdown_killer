@@ -16,6 +16,14 @@
   - 深度支持格式化嵌套排版（如加粗内含斜体符号、嵌套的多层级引用等）。
   - 全面涵盖多类 Markdown 语法（代码块、行内代码、标题、链接（转为 `描述文本( url )`，保留地址）与图片、引用、无序/有序列表、删除线等）。
 
+## 新版特性 (0.5.0)：拟人模式
+- **独立开关 `enable_humanize`**（默认关）。开启后，LLM 的最终回复不再按规则清洗 Markdown，而是交给一个便宜的模型改写成真人发消息的样子：直接给结论、口语、1 到 3 段、不用 Markdown、不罗列线索和来源。只简化最终发到 IM 的内容，不改 agent 自己的对话记录。
+- **示例为主、遵守人格**：改写 prompt 只有几句说明，主要靠 4 组示例（罗列线索的调研回复、带人格的选购对比、步骤教程、本来就口语的短句）教模型怎么说。`humanize_use_persona`（默认开）会把本会话当前生效的人格提示词和示例对话（AstrBot 在 `on_llm_request` 前解析好的 `persona` / `persona_examples` 锚点）放进改写请求，让改写后的消息沿用人格的自称、称呼、口癖和语气；人格里关于工具、格式、篇幅的要求不采用。人格过长时按 `humanize_persona_max_chars`（默认 3000 字）截断。
+- **只删不加**：改写结果要过确定性校验，比原文还长、出现原文没有的链接或数字、带工具调用语法，都判为失败。回复太短（`humanize_min_chars`）、含代码块、消息里有图片、超时或模型出错时，回退到原来的规则清洗，原回复照常发出。
+- **调用方式**：直接请求 OpenAI 兼容的 `/chat/completions`（`humanize_base_url` / `humanize_model` / `humanize_api_key`）。`humanize_extra_body` 默认是 `{"prompt_cache_policy": "no_store", "chat_template_kwargs": {"enable_thinking": false}}`：halogen 照常读前缀缓存，但这次一次性调用不新建缓存条目、不写 SSD 缓存，也不会挤掉真实对话的缓存；同时关闭思考。其他服务端不认识这些字段时可以清空。
+- **告知 agent（`humanize_notify_agent`，默认开）**：改写后插件记下用户实际看到的内容和被省略的要点，在该会话下一次正常请求时，以 user 身份的 `<context_unit name="reply_simplified">` 带入，并随该轮持久化。这是写入标记型提醒，本身不触发 LLM；steer 进正在运行的 turn 的消息不经过 `on_llm_request`，提醒会留到下一次正常请求。每个会话最多攒 3 条，插件重启会丢掉还没带入的提醒。
+- **流式输出**时回复已经原样发出，拟人模式无法改写，只在日志里告警一次。
+
 ## 0.4.1 修复
 - **不再吞掉换行**：移除 `segment_boundary` 换行模式。该模式会删除 `。？！~…` 之后的换行，原本用于规避 AstrBot 早期分段回复把换行留在下一段开头、显示为空行的问题；AstrBot 现已对每个分段 `strip()`（AstrBotDevs/AstrBot#8304），该模式只剩副作用，会把 DeepSeek 等逐句换行的输出挤成一整段。现在始终保留换行，`remove_extra_newlines` 只压缩连续空行；`newline_mode` 已废弃并被忽略。
 
@@ -74,6 +82,7 @@
 - **表格渲染失败回退策略 (`table_render_fallback`)**：默认为 `text`。可选 `text`（转为纯文本，去分隔行）、`raw`（保留原始 Markdown 表格文本）、`remove`（直接丢弃表格内容）。
 - **启用公式图片渲染 (`enable_formula_render`)**：默认为开启。含公式的完整消息会保留 Markdown 格式并统一渲染为单张图片。
 - **公式渲染失败回退策略 (`formula_render_fallback`)**：默认为 `raw`。可选 `raw`（保留原始公式）、`text`（去定界符保留内容）或 `remove`（丢弃）。
+- **拟人模式 (`enable_humanize`)** 及 `humanize_base_url`、`humanize_api_key`、`humanize_model`、`humanize_extra_body`、`humanize_temperature`（默认 0.7，负数表示不传）、`humanize_timeout`（默认 20 秒）、`humanize_min_chars`（默认 80）、`humanize_use_persona`（默认开）、`humanize_persona_max_chars`（默认 3000）、`humanize_notify_agent`（默认开）：见上文"拟人模式"。
 
 ## 作者
 xkeyC（fork 维护）

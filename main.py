@@ -18,6 +18,7 @@ try:
         split_text_around_formulas,
         split_text_around_tables,
     )
+    from .utils import humanizer
     from .utils.link_processor import convert_markdown_links, protect_urls
     from .utils.model_markup import strip_model_markup
     from .utils.list_processor import remove_list_markers as _remove_list_markers_impl
@@ -34,6 +35,7 @@ except ImportError:  # pragma: no cover - fallback when loaded as top-level modu
         split_text_around_formulas,
         split_text_around_tables,
     )
+    from utils import humanizer  # type: ignore
     from utils.link_processor import convert_markdown_links, protect_urls  # type: ignore
     from utils.model_markup import strip_model_markup  # type: ignore
     from utils.list_processor import (  # type: ignore
@@ -46,13 +48,17 @@ import re
 import time
 
 _PLAYWRIGHT_RETRY_COOLDOWN_SEC = 600
+# 每个会话最多攒几条"回复已简化"提醒，等下一次正常请求时一起带上。
+_MAX_PENDING_REMINDERS = 3
+_REMINDER_UNIT = "reply_simplified"
+_PERSONA_EXTRA = "_markdown_killer_persona"
 
 
 @register(
     "astrbot_plugin_markdown_killer",
     "xkeyC",
     "移除输出中的Markdown格式（保留列表标记换行、支持表格与公式图片渲染）",
-    "0.4.1",
+    "0.5.0",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):
@@ -90,6 +96,66 @@ class MarkdownKillerPlugin(Star):
         self._env_manager: EnvManager | None = None
         self._env_lock = asyncio.Lock()
         self._playwright_retry_at = 0.0
+
+        # 拟人模式：独立开关。开启后 LLM 回复不再按规则清洗 Markdown，而是交给
+        # 一个便宜的模型改写成口语短消息；改写失败或跳过时才回退到规则清洗。
+        self.enable_humanize = bool(self._config_get("enable_humanize", False))
+        self.humanize_notify_agent = bool(
+            self._config_get("humanize_notify_agent", True)
+        )
+        self.humanize_cfg = self._build_humanize_config()
+        # unified_msg_origin -> 待带入的提醒。只写入标记，不触发 LLM：
+        # 由该会话下一次正常请求（on_llm_request）带进去。
+        self._pending_reminders: dict[str, list[str]] = {}
+        # 拟人模式改写时要遵守当前人格的说话方式。人格由 AstrBot 在
+        # on_llm_request 之前解析好放在 req.context_anchors 里，这里按会话记下。
+        self.humanize_use_persona = bool(self._config_get("humanize_use_persona", True))
+        self.humanize_persona_max_chars = self._coerce_int(
+            self._config_get("humanize_persona_max_chars", 3000), default=3000
+        )
+        self._session_persona: dict[str, str] = {}
+        self._humanize_streaming_warned = False
+        if self.enable_humanize and not self.humanize_cfg.ready:
+            logger.warning(
+                "[MarkdownKiller] 拟人模式已开启，但没有填改写模型的地址或模型名，"
+                "暂时按普通清洗处理。"
+            )
+
+    def _build_humanize_config(self) -> "humanizer.HumanizeConfig":
+        try:
+            extra_body = humanizer.parse_extra_body(
+                self._config_get("humanize_extra_body", None)
+            )
+        except (TypeError, ValueError) as e:
+            logger.error(
+                f"[MarkdownKiller] 拟人模式额外请求体不是合法 JSON，改用默认值: {e}"
+            )
+            extra_body = dict(humanizer.DEFAULT_EXTRA_BODY)
+        temperature = self._config_get("humanize_temperature", 0.7)
+        try:
+            temperature = float(temperature)
+        except (TypeError, ValueError):
+            temperature = 0.7
+        return humanizer.HumanizeConfig(
+            base_url=str(self._config_get("humanize_base_url", "") or ""),
+            api_key=str(self._config_get("humanize_api_key", "") or ""),
+            model=str(self._config_get("humanize_model", "") or ""),
+            extra_body=extra_body,
+            temperature=temperature if temperature >= 0 else None,
+            timeout=float(
+                self._coerce_int(self._config_get("humanize_timeout", 20), default=20)
+            ),
+            min_chars=self._coerce_int(
+                self._config_get("humanize_min_chars", 80), default=80
+            ),
+        )
+
+    @property
+    def _humanize_active(self) -> bool:
+        # getattr: 测试里有用 __new__ 绕过 __init__ 构造的实例。
+        if not getattr(self, "enable_humanize", False):
+            return False
+        return self.humanize_cfg.ready
 
     async def initialize(self) -> None:
         """Called when the plugin is activated. Sets up Playwright env if enabled."""
@@ -248,18 +314,124 @@ class MarkdownKillerPlugin(Star):
             resp.completion_text = stripped_text
             self._log_cleaned_text(original_text, stripped_text, source="[引用标记]")
             original_text = stripped_text
-        if (
-            self.enable_formula_render
-            and self._playwright_available
-            and contains_latex_formulas(original_text)
-        ):
+        if self._humanize_active:
+            # 拟人模式在 on_decorating_result 里改写整条消息；改写不了时再清洗。
             return
 
-        cleaned_text = self.remove_markdown(original_text)
-
+        cleaned_text = self._clean_llm_text(original_text)
         if original_text != cleaned_text:
             resp.completion_text = cleaned_text
             self._log_cleaned_text(original_text, cleaned_text)
+
+    def _clean_llm_text(self, text: str) -> str:
+        """LLM 回复的规则清洗；含公式时原样保留，交给公式渲染。"""
+        if (
+            self.enable_formula_render
+            and self._playwright_available
+            and contains_latex_formulas(text)
+        ):
+            return text
+        return self.remove_markdown(text)
+
+    @filter.on_llm_request()
+    async def on_llm_req(self, event: AstrMessageEvent, req, *args):
+        """把攒下的"回复已简化"提醒以 user 身份带进本次请求，并随本轮持久化。
+
+        这是写入标记型提醒：本身不触发 LLM。steer 进正在运行的 turn 的消息不走
+        这个钩子，提醒会留到该会话下一次正常请求。
+        """
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        if self._humanize_active and self.humanize_use_persona:
+            persona = humanizer.persona_from_anchors(
+                getattr(req, "context_anchors", None) or {},
+                self.humanize_persona_max_chars,
+            )
+            if umo:
+                self._session_persona[umo] = persona
+            set_extra = getattr(event, "set_extra", None)
+            if callable(set_extra):
+                set_extra(_PERSONA_EXTRA, persona)
+        reminders = self._pending_reminders.pop(umo, None)
+        if not reminders:
+            return
+        add = getattr(req, "add_persistent_context", None)
+        if not callable(add):
+            logger.warning("[MarkdownKiller] 当前 AstrBot 不支持持久上下文，提醒已丢弃")
+            return
+        add(_REMINDER_UNIT, "\n\n".join(reminders))
+        logger.info(f"[MarkdownKiller] 已把 {len(reminders)} 条简化提醒带入 {umo}")
+
+    def _persona_for(self, event) -> str:
+        """本条回复所属请求的人格；拿不到时用该会话上一次请求的。"""
+        if not self.humanize_use_persona:
+            return ""
+        get_extra = getattr(event, "get_extra", None)
+        persona = get_extra(_PERSONA_EXTRA) if callable(get_extra) else None
+        if isinstance(persona, str):
+            return persona
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        return self._session_persona.get(umo, "")
+
+    def _queue_reminder(self, umo: str, text: str) -> None:
+        if not umo:
+            return
+        pending = self._pending_reminders.setdefault(umo, [])
+        pending.append(text)
+        del pending[:-_MAX_PENDING_REMINDERS]
+
+    async def _humanize_result(self, event: AstrMessageEvent, result) -> None:
+        """拟人模式：改写一条 LLM 结果；跳过或失败时回退到规则清洗。"""
+        plains = [c for c in result.chain if isinstance(c, Comp.Plain)]
+        others = [
+            c
+            for c in result.chain
+            if not isinstance(c, Comp.Plain) and type(c).__name__ not in ("Reply", "At")
+        ]
+        original = "".join(getattr(c, "text", "") or "" for c in plains)
+
+        reason = None
+        if others:
+            reason = "消息里有图片等非文本内容"
+        else:
+            reason = humanizer.skip_reason(original, self.humanize_cfg.min_chars)
+        result_obj = None
+        if reason is None:
+            try:
+                result_obj = await humanizer.rewrite(
+                    original, self.humanize_cfg, persona=self._persona_for(event)
+                )
+                reason = humanizer.check_result(original, result_obj)
+            except Exception as e:  # noqa: BLE001 - 任何失败都回退
+                reason = f"改写失败: {e}"
+
+        if reason is not None or result_obj is None:
+            logger.info(f"[MarkdownKiller] 拟人模式未改写（{reason}），按普通清洗处理")
+            for comp in plains:
+                text = comp.text
+                cleaned = self._clean_llm_text(text) if text else text
+                if cleaned != text:
+                    comp.text = cleaned
+                    self._log_cleaned_text(text, cleaned)
+            return
+
+        # 改写结果偶尔仍带格式，过一遍规则清洗兜底（对纯文本基本无改动）。
+        reply = humanizer.normalize_reply(self.remove_markdown(result_obj.reply))
+        first = plains[0]
+        first.text = reply
+        dropped = {id(c) for c in plains[1:]}
+        result.chain = [c for c in result.chain if id(c) not in dropped]
+        self._log_cleaned_text(original, reply, source="[拟人模式]")
+        logger.info(
+            f"[MarkdownKiller] 拟人模式改写 {len(original)} -> {len(reply)} 字，"
+            f"省略 {len(result_obj.omitted)} 项，耗时 {result_obj.elapsed:.2f}s"
+        )
+        if self.humanize_notify_agent:
+            self._queue_reminder(
+                getattr(event, "unified_msg_origin", "") or "",
+                humanizer.build_reminder(
+                    reply, result_obj.omitted, time.strftime("%m-%d %H:%M")
+                ),
+            )
 
     @filter.on_decorating_result()
     async def on_decorating_result(self, event: AstrMessageEvent):
@@ -274,7 +446,18 @@ class MarkdownKillerPlugin(Star):
 
         # Streaming results were already shown to the user as raw text; skip.
         if result.result_content_type == ResultContentType.STREAMING_FINISH:
+            if self._humanize_active and not self._humanize_streaming_warned:
+                self._humanize_streaming_warned = True
+                logger.warning(
+                    "[MarkdownKiller] 流式输出已经原样发出，拟人模式无法改写；"
+                    "需要拟人模式请关闭流式输出。"
+                )
             return
+
+        if self._humanize_active and result.result_content_type == getattr(
+            ResultContentType, "LLM_RESULT", None
+        ):
+            await self._humanize_result(event, result)
 
         # Phase 1: extract tables/formulas and render them to images.
         rendered_image_ids: set[int] = set()

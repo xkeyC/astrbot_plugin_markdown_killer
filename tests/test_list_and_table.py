@@ -254,6 +254,10 @@ def _load_plugin_class_for_tests():
         def on_decorating_result(*_args, **_kwargs):
             return lambda fn: fn
 
+        @staticmethod
+        def on_llm_request(*_args, **_kwargs):
+            return lambda fn: fn
+
     class _MessageChain:
         def __init__(self, chain=None):
             self.chain = list(chain or [])
@@ -291,7 +295,7 @@ def _load_plugin_class_for_tests():
     message_pkg = types.ModuleType("astrbot.core.message")
     result_pkg = types.ModuleType("astrbot.core.message.message_event_result")
     result_pkg.ResultContentType = types.SimpleNamespace(
-        STREAMING_FINISH="STREAMING_FINISH"
+        STREAMING_FINISH="STREAMING_FINISH", LLM_RESULT="LLM_RESULT"
     )
     sys.modules["astrbot.core"] = core_pkg
     sys.modules["astrbot.core.message"] = message_pkg
