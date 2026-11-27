@@ -89,7 +89,7 @@
         "description": "拟人模式：额外请求体（JSON）",
         "type": "text",
         "default": "{\"prompt_cache_policy\": \"no_store\", \"chat_template_kwargs\": {\"enable_thinking\": false}}",
-        "hint": "合并进请求体的顶层字段。默认值针对 halogen：prompt_cache_policy=no_store 让这次一次性调用照常读前缀缓存，但不新建缓存条目、不写 SSD 缓存、不挤掉真实对话的缓存；enable_thinking=false 关闭思考。其他服务端不认识这些字段时可清空。"
+        "hint": "合并进请求体的顶层字段。默认值针对 halogen：prompt_cache_policy=no_store 让这次一次性调用照常读前缀缓存，但不新建缓存条目、不写 SSD 缓存、不挤掉真实对话的缓存；enable_thinking=false 关闭思考（实测 reasoning_effort=low 慢一倍且质量没更好；想试可把 chat_template_kwargs 换成 \"reasoning_effort\": \"low\"）。输出格式由插件用 response_format json_schema 约束。其他服务端不认识这些字段时可清空。"
     },
     "humanize_temperature": {
         "description": "拟人模式：温度",

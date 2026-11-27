@@ -13,21 +13,41 @@
 
 from __future__ import annotations
 
+import difflib
 import json
 import re
 import time
 from dataclasses import dataclass, field
 
 # halogen-flash-server：读缓存但什么都不存（不建条目、不写 SSD、不挤占真实对话）；
-# 关思考：改写不需要推理，开着只会多等几秒。不认识这两个字段的服务端一般会忽略。
+# 关思考：2026-11-27 对比过 reasoning_effort=low，每条慢一倍（约 5–6 s 对 2.7 s），
+# 质量没有更好，还更容易把示例里的话抄进回复；想试可改成 {"reasoning_effort": "low"}。
 DEFAULT_EXTRA_BODY: dict = {
     "prompt_cache_policy": "no_store",
     "chat_template_kwargs": {"enable_thinking": False},
 }
 
+# 约束输出为 {"reply", "omitted"}：模型在字符串里写未转义的引号时，JSON 不会坏。
+RESPONSE_FORMAT: dict = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "humanized_reply",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "reply": {"type": "string"},
+                "omitted": {"type": "array", "items": {"type": "string"}},
+            },
+            "required": ["reply", "omitted"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 SYSTEM_PROMPT = """你把聊天机器人写好的回复，改成真人在 QQ/微信里随手打的消息。你只改写，不回答问题。
 
-看下面的示例学说法：开头先说结论，最多顺口带一句理由；不罗列线索和来源，不用 Markdown 和列表，分一到三段；只删不加，数字、链接、名称照抄，"可能""没证实"这类话要留着。给了 <persona> 时按它的自称、称呼、口癖和语气说话，原文语气不一样也要改过来。
+看下面的示例学说法：开头先说结论，最多顺口带一句理由；不罗列线索和来源，不用 Markdown 和列表，分一到三段；只删不加，数字、链接、名称照抄，"可能""没证实"这类话要留着。给了 <persona> 时按它的自称、称呼、口癖和语气说话，原文语气不一样也要改过来。机器人写的回复几乎都能删掉一半以上，不要原样照抄。示例里的人格和口癖只属于各自的示例，不要带到别的回复里；没给 <persona> 就跟原文的语气走。
 
 只输出 JSON：{"reply": "改写后的消息", "omitted": ["删掉的一项实质信息"]}。omitted 不记客套话和格式。"""
 
@@ -61,19 +81,17 @@ EXAMPLES: list[tuple[str, str, dict]] = [
         },
     ),
     (
-        "你是猫娘，自称“本喵”，叫对方“主人”，句尾常带“喵”。",
-        """哼，主人又来问这种问题了喵～
-
-关于你问的显卡选择，我仔细对比了一下：
+        "说话冷淡、简短，不用语气词，也不寒暄。",
+        """好的！关于你问的显卡选择，我仔细对比了一下：
 - **RTX 5070**：价格 4599 元，性能大约比上代提升 20%，功耗 250W
 - **RX 9070**：价格 4299 元，光栅性能略强，但光追稍弱
 - 另外还有二手 4070 Ti 可以考虑，大概 3800 元左右
 
-如果你主要玩 3A 大作并且看重光追和 DLSS，选 5070；如果预算紧张并且不怎么开光追，9070 更划算喵。
+如果你主要玩 3A 大作并且看重光追和 DLSS，选 5070；如果预算紧张并且不怎么开光追，9070 更划算。
 
-总之看你自己的需求啦，本喵只是给个建议～""",
+总之还是要看你自己的需求哦，以上仅供参考～""",
         {
-            "reply": "主人又问这个喵～\n\n看重光追和 DLSS 就上 5070，4599 元；预算紧、不怎么开光追的话，本喵觉得 4299 元的 9070 更划算喵。",
+            "reply": "看重光追和 DLSS 就买 5070，4599 元。预算紧、不开光追，买 4299 元的 9070。",
             "omitted": [
                 "5070 比上代强约 20%、功耗 250W",
                 "9070 光栅略强",
@@ -97,9 +115,21 @@ EXAMPLES: list[tuple[str, str, dict]] = [
         },
     ),
     (
-        "",
-        "哈哈，那确实挺离谱的😂 下次记得**提前存档**就好啦",
-        {"reply": "哈哈，那确实挺离谱的😂 下次记得提前存档就好啦", "omitted": []},
+        "开头用【】写一个小动作或情绪，说话干脆。",
+        """【眨眼】查到了，说明书上写的就是 20000 mAh，你记的没错。
+
+根据官网参数页，2024 新款的电芯容量与老款相同，5V 输出时的额定容量为 12000 mAh。新款的改进集中在两方面：其一是快充协议升级，支持 PD 65W；其二是外壳换成了铝合金。该系列共有 10000、20000、30000 三档。
+
+综上，你此前按 20000 估算的"手机能充 4 次左右"是成立的；我之前提到的"新款容量变小"属于误判，在此更正。以上信息来自官网产品页（example.com/power-bank），并与两家评测的数据交叉核对过。""",
+        {
+            "reply": "【眨眼】查到了，就是 20000 mAh，你记的没错。\n\n新款只换了快充和外壳，容量跟老款一样，按 20000 算能充 4 次左右。之前说新款容量变小，是我说错了。",
+            "omitted": [
+                "5V 输出时额定容量 12000 mAh",
+                "新款支持 PD 65W",
+                "全系有 10000 / 20000 / 30000 三档",
+                "来源：官网产品页 example.com/power-bank，两家评测数字一致",
+            ],
+        },
     ),
 ]
 
@@ -118,7 +148,8 @@ class HumanizeConfig:
     extra_body: dict = field(default_factory=lambda: dict(DEFAULT_EXTRA_BODY))
     temperature: float | None = 0.7
     timeout: float = 30.0
-    max_tokens: int = 1024
+    max_tokens: int = 4096
+    json_schema: bool = True
     min_chars: int = 80
 
     @property
@@ -194,6 +225,8 @@ def build_payload(text: str, cfg: HumanizeConfig, persona: str = "") -> dict:
     }
     if cfg.temperature is not None:
         payload["temperature"] = cfg.temperature
+    if cfg.json_schema:
+        payload["response_format"] = RESPONSE_FORMAT
     payload.update(cfg.extra_body)
     return payload
 
@@ -209,7 +242,9 @@ def parse_output(raw: str) -> HumanizeResult | None:
     try:
         data = json.loads(text[start : end + 1])
     except ValueError:
-        return None
+        data = _salvage(text[start : end + 1])
+        if data is None:
+            return None
     if not isinstance(data, dict):
         return None
     reply = data.get("reply")
@@ -224,6 +259,22 @@ def parse_output(raw: str) -> HumanizeResult | None:
         if isinstance(item, (str, int, float)) and str(item).strip()
     ]
     return HumanizeResult(reply=reply.strip(), omitted=omitted)
+
+
+_SALVAGE = re.compile(
+    r'^\{\s*"reply"\s*:\s*"(?P<reply>.*)"\s*,\s*"omitted"\s*:\s*\[(?P<omitted>.*)\]\s*\}$',
+    re.DOTALL,
+)
+
+
+def _salvage(text: str) -> dict | None:
+    """字符串里有未转义引号的 JSON：按固定的两个字段硬拆。"""
+    match = _SALVAGE.match(text)
+    if not match:
+        return None
+    reply = match.group("reply").replace("\\n", "\n").replace('\\"', '"')
+    items = re.findall(r'"((?:[^"\\]|\\.)*)"', match.group("omitted"))
+    return {"reply": reply, "omitted": [i.replace('\\"', '"') for i in items]}
 
 
 def _urls(text: str) -> set[str]:
@@ -245,6 +296,20 @@ def check_result(original: str, result: HumanizeResult) -> str | None:
     if new_numbers:
         return f"出现原文没有的数字: {min(new_numbers)}"
     return None
+
+
+_IGNORED_FOR_DIFF = re.compile(r"[\s*#_`>~|-]+")
+
+
+def is_unchanged(original: str, result: HumanizeResult) -> bool:
+    """模型基本原样返回（只去了格式）：不算一次简化，也不该提醒 agent。"""
+    if result.omitted:
+        return False
+    a = _IGNORED_FOR_DIFF.sub("", original)
+    b = _IGNORED_FOR_DIFF.sub("", result.reply)
+    if a == b:
+        return True
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).ratio() >= 0.95
 
 
 def normalize_reply(text: str) -> str:

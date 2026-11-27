@@ -31,6 +31,12 @@ def test_parse_output():
     assert ok and ok.reply == "嗯，可能是缓存" and ok.omitted == ["三条线索"]
     junk = humanizer.parse_output('好的：{"reply": "行", "omitted": "一项"} 完')
     assert junk and junk.omitted == ["一项"]
+    # 字符串里有未转义引号：按两个字段硬拆
+    broken = humanizer.parse_output(
+        '{"reply": "路线图只写着"进行中"。\\n\\n等公告吧", "omitted": ["链接"]}'
+    )
+    assert broken and broken.reply == '路线图只写着"进行中"。\n\n等公告吧'
+    assert broken.omitted == ["链接"]
     assert humanizer.parse_output("不是 JSON") is None
     assert humanizer.parse_output('{"reply": "  ", "omitted": []}') is None
     assert humanizer.parse_output('{"omitted": []}') is None
@@ -71,6 +77,11 @@ def test_skip_and_payload():
     assert payload["prompt_cache_policy"] == "no_store"
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
     assert payload["model"] == "m" and payload["stream"] is False
+    assert payload["response_format"]["type"] == "json_schema"
+    no_schema = humanizer.HumanizeConfig(
+        base_url="http://h", model="m", json_schema=False
+    )
+    assert "response_format" not in humanizer.build_payload(LONG, no_schema)
     assert LONG.strip() in payload["messages"][-1]["content"]
     print("OK  skip rules, extra body parsing, payload carries no_store + thinking off")
 
@@ -245,6 +256,21 @@ def test_plugin_fallbacks():
         asyncio.run(off.on_llm_resp(None, resp))
         assert resp.completion_text == "粗体"
 
+        # 模型原样返回：按普通清洗发出，不留提醒
+        async def same(text, cfg, persona="", client=None):
+            return humanizer.HumanizeResult(text.replace("**", ""), [], 4.5)
+
+        main_module.humanizer.rewrite = same
+        plugin = _plugin(dict(CFG))
+        a, b = Plain("**一段**本来就该原样发的文案，"), Plain("内容" * 40)
+        result = _Result([a, b])
+        event = _Event(result)
+        asyncio.run(plugin.on_decorating_result(event))
+        assert result.chain == [a, b] and a.text == "一段本来就该原样发的文案，"
+        req = _Req()
+        asyncio.run(plugin.on_llm_req(event, req))
+        assert req.units == []
+
         # 关闭通知时不留提醒
         async def ok(text, cfg, persona="", client=None):
             return humanizer.HumanizeResult("短的", [], 0.0)
@@ -259,6 +285,16 @@ def test_plugin_fallbacks():
     finally:
         main_module.humanizer.rewrite = original
     print("OK  failure/streaming/unconfigured/notify-off fall back without reminders")
+
+
+def test_unchanged_is_not_a_rewrite():
+    R = humanizer.HumanizeResult
+    src = "**这是**一段本来就该原样发的文案，" + "内容" * 40
+    assert humanizer.is_unchanged(src, R(src.replace("**", ""), []))
+    assert humanizer.is_unchanged(src, R(src.replace("**", "") + "。", []))
+    assert not humanizer.is_unchanged(src, R(src.replace("**", ""), ["一项"]))
+    assert not humanizer.is_unchanged(LONG, R("可能是缓存的问题。", []))
+    print("OK  a rewrite that returns the original is detected")
 
 
 def test_prompt_examples_and_persona():
@@ -292,6 +328,7 @@ def main():
     test_skip_and_payload()
     test_rewrite_http()
     test_prompt_examples_and_persona()
+    test_unchanged_is_not_a_rewrite()
     test_plugin_humanize_and_reminder()
     test_plugin_fallbacks()
     print("ALL HUMANIZE TESTS PASSED")

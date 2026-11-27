@@ -58,7 +58,7 @@ _PERSONA_EXTRA = "_markdown_killer_persona"
     "astrbot_plugin_markdown_killer",
     "xkeyC",
     "移除输出中的Markdown格式（保留列表标记换行、支持表格与公式图片渲染）",
-    "0.5.0",
+    "0.5.1",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):
@@ -404,6 +404,9 @@ class MarkdownKillerPlugin(Star):
             except Exception as e:  # noqa: BLE001 - 任何失败都回退
                 reason = f"改写失败: {e}"
 
+        if reason is None and result_obj is not None:
+            if humanizer.is_unchanged(original, result_obj):
+                reason = f"模型认为无需简化，耗时 {result_obj.elapsed:.2f}s"
         if reason is not None or result_obj is None:
             logger.info(f"[MarkdownKiller] 拟人模式未改写（{reason}），按普通清洗处理")
             for comp in plains:
