@@ -53,13 +53,17 @@ _PLAYWRIGHT_RETRY_COOLDOWN_SEC = 600
 _MAX_PENDING_REMINDERS = 3
 _REMINDER_UNIT = "reply_simplified"
 _PERSONA_EXTRA = "_markdown_killer_persona"
+_CONTEXT_EXTRA = "_markdown_killer_context"
+# 改写时给模型看的最近群聊条数、bot 历史条数。
+_RECENT_GROUP_MESSAGES = 5
+_RECENT_BOT_MESSAGES = 2
 
 
 @register(
     "astrbot_plugin_markdown_killer",
     "xkeyC",
     "移除输出中的Markdown格式（保留列表标记换行、支持表格与公式图片渲染）",
-    "0.6.1",
+    "0.6.2",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):
@@ -115,6 +119,10 @@ class MarkdownKillerPlugin(Star):
             self._config_get("humanize_persona_max_chars", 3000), default=3000
         )
         self._session_persona: dict[str, str] = {}
+        # 用户原话和触发时的最近群聊（来自请求自带的 group_history 单元），按会话
+        # 记下供 wake 回合沿用；bot 最近几条消息（改写前, 实际发出）。
+        self._session_context: dict[str, "humanizer.ChatContext"] = {}
+        self._bot_history: dict[str, list[tuple[str, str]]] = {}
         self._humanize_streaming_warned = False
         if self.enable_humanize and not self.humanize_cfg.ready:
             logger.warning(
@@ -361,6 +369,13 @@ class MarkdownKillerPlugin(Star):
             set_extra = getattr(event, "set_extra", None)
             if callable(set_extra):
                 set_extra(_PERSONA_EXTRA, persona)
+        if self._humanize_active:
+            ctx = self._context_from_request(event, req)
+            if umo:
+                self._session_context[umo] = ctx
+            set_extra = getattr(event, "set_extra", None)
+            if callable(set_extra):
+                set_extra(_CONTEXT_EXTRA, ctx)
         reminders = self._pending_reminders.pop(umo, None)
         if not reminders:
             return
@@ -370,6 +385,47 @@ class MarkdownKillerPlugin(Star):
             return
         add(_REMINDER_UNIT, "\n\n".join(reminders))
         logger.info(f"[MarkdownKiller] 已把 {len(reminders)} 条简化提醒带入 {umo}")
+
+    @staticmethod
+    def _context_from_request(event, req) -> "humanizer.ChatContext":
+        """用户原话、发言人和触发时最近的群聊：都取自请求本身带的内容。"""
+        question = str(getattr(event, "message_str", "") or "").strip()
+        if not question:
+            question = str(getattr(req, "prompt", "") or "").strip()
+        sender = getattr(getattr(event, "message_obj", None), "sender", None)
+        asker = str(getattr(sender, "nickname", "") or "").strip()
+        recent: list[str] = []
+        for part in getattr(req, "persistent_user_context_parts", None) or []:
+            text = getattr(part, "text", None)
+            if isinstance(text, str) and text.startswith(
+                '<context_unit name="group_history"'
+            ):
+                recent = humanizer.recent_from_group_history(
+                    text, _RECENT_GROUP_MESSAGES
+                )
+        return humanizer.ChatContext(question=question, asker=asker, recent=recent)
+
+    def _context_for(self, event) -> "humanizer.ChatContext":
+        """本条回复所属请求的上下文；wake 回合没有请求钩子，沿用该会话上一次的。"""
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        get_extra = getattr(event, "get_extra", None)
+        ctx = get_extra(_CONTEXT_EXTRA) if callable(get_extra) else None
+        if not isinstance(ctx, humanizer.ChatContext):
+            ctx = self._session_context.get(umo) or humanizer.ChatContext()
+        return humanizer.ChatContext(
+            question=ctx.question,
+            asker=ctx.asker,
+            recent=list(ctx.recent),
+            bot=list(self._bot_history.get(umo, [])),
+        )
+
+    def _remember_bot_message(self, event, before: str, sent: str) -> None:
+        umo = getattr(event, "unified_msg_origin", "") or ""
+        if not umo or not sent.strip():
+            return
+        history = self._bot_history.setdefault(umo, [])
+        history.append((before, sent))
+        del history[:-_RECENT_BOT_MESSAGES]
 
     def _persona_for(self, event) -> str:
         """本条回复所属请求的人格；拿不到时用该会话上一次请求的。"""
@@ -446,12 +502,16 @@ class MarkdownKillerPlugin(Star):
         else:
             reason = humanizer.skip_reason(original, self.humanize_cfg.min_chars)
         result_obj = None
+        ctx = self._context_for(event)
         if reason is None:
             try:
                 result_obj = await humanizer.rewrite(
-                    original, self.humanize_cfg, persona=self._persona_for(event)
+                    original,
+                    self.humanize_cfg,
+                    persona=self._persona_for(event),
+                    ctx=ctx,
                 )
-                reason = humanizer.check_result(original, result_obj)
+                reason = humanizer.check_result(original, result_obj, ctx.question)
             except Exception as e:  # noqa: BLE001 - 任何失败都回退
                 # httpx 的超时异常 str() 是空串，带上类型才看得出是超时。
                 reason = f"改写失败: {type(e).__name__}: {e}".rstrip(": ")
@@ -467,6 +527,9 @@ class MarkdownKillerPlugin(Star):
                 if cleaned != text:
                     comp.text = cleaned
                     self._log_cleaned_text(text, cleaned)
+            self._remember_bot_message(
+                event, original, "".join(c.text or "" for c in plains)
+            )
             return
 
         # 改写结果偶尔仍带格式，过一遍规则清洗兜底（对纯文本基本无改动）。
@@ -476,6 +539,7 @@ class MarkdownKillerPlugin(Star):
         dropped = {id(c) for c in plains[1:]}
         result.chain = [c for c in result.chain if id(c) not in dropped]
         self._log_cleaned_text(original, reply, source="[拟人模式]")
+        self._remember_bot_message(event, original, reply)
         logger.info(
             f"[MarkdownKiller] 拟人模式改写 {len(original)} -> {len(reply)} 字，"
             f"省略 {len(result_obj.omitted)} 项，耗时 {result_obj.elapsed:.2f}s"

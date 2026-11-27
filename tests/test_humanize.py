@@ -264,7 +264,7 @@ def test_plugin_humanize_and_reminder():
     calls = []
     personas = []
 
-    async def fake_rewrite(text, cfg, persona="", client=None):
+    async def fake_rewrite(text, cfg, persona="", client=None, ctx=None):
         calls.append(text)
         personas.append(persona)
         return humanizer.HumanizeResult(
@@ -329,7 +329,7 @@ def test_plugin_fallbacks():
     class ReadTimeout(Exception):
         """像 httpx.ReadTimeout 一样 str() 为空。"""
 
-    async def failing(text, cfg, persona="", client=None):
+    async def failing(text, cfg, persona="", client=None, ctx=None):
         calls.append(text)
         raise ReadTimeout()
 
@@ -390,7 +390,7 @@ def test_plugin_fallbacks():
         assert bare.completion_text == "粗体"
 
         # 模型原样返回：按普通清洗发出，不留提醒
-        async def same(text, cfg, persona="", client=None):
+        async def same(text, cfg, persona="", client=None, ctx=None):
             return humanizer.HumanizeResult(text.replace("**", ""), [], 4.5)
 
         main_module.humanizer.rewrite = same
@@ -405,7 +405,7 @@ def test_plugin_fallbacks():
         assert req.units == []
 
         # 关闭通知时不留提醒
-        async def ok(text, cfg, persona="", client=None):
+        async def ok(text, cfg, persona="", client=None, ctx=None):
             return humanizer.HumanizeResult("短的", [], 0.0)
 
         main_module.humanizer.rewrite = ok
@@ -417,6 +417,101 @@ def test_plugin_fallbacks():
     finally:
         main_module.humanizer.rewrite = original
     print("OK  failure/err/streaming/unconfigured/unchanged/notify-off fall back")
+
+
+GROUP_HISTORY = (
+    '<context_unit name="group_history" id="r9">\n<group_history>\nEarlier messages ...\n'
+    "[卡尔 | ID: 1 | 2026-11-28 00:01:00]:  这个有市场\n"
+    "[阿亚 | ID: 2 | 2026-11-28 00:01:05]:  什么米奸？\n"
+    "[卡尔 | ID: 1 | 2026-11-28 00:01:09]:  [图片]\n"
+    "[阿亚 | ID: 2 | 2026-11-28 00:01:10]:  第一行\n第二行\n"
+    "[小明 | ID: 3 | 2026-11-28 00:01:20]:  6\n"
+    "[小红 | ID: 4 | 2026-11-28 00:01:30]:  " + "长" * 200 + "\n"
+    "</group_history>\n</context_unit>"
+)
+
+
+def test_context_rendering():
+    recent = humanizer.recent_from_group_history(GROUP_HISTORY, 5)
+    assert len(recent) == 5 and recent[0] == "阿亚: 什么米奸？"
+    assert "阿亚: 第一行 第二行" in recent and recent[-1].endswith("…")
+    ctx = humanizer.ChatContext(
+        question="SSD 寿命查到了吗",
+        asker="xkeyC",
+        recent=recent,
+        bot=[("长长的原文", "短的"), ("一样", "一样")],
+    )
+    msgs = humanizer.build_messages(LONG, persona="自称本喵", ctx=ctx)
+    last = msgs[-1]["content"]
+    # 顺序：上下文 → 人格 → 醒目的提问 → 回复
+    order = [
+        last.index(x)
+        for x in ("<chat_context>", "<persona>", "用户原始提问", "<reply>")
+    ]
+    assert order == sorted(order)
+    assert "<question>\nxkeyC：SSD 寿命查到了吗\n</question>" in last
+    assert "- 原文：长长的原文\n  发出：短的" in last and "- 发出：一样" in last
+    # 示例也带提问，但不带上下文
+    assert (
+        "<question>" in msgs[1]["content"]
+        and "<chat_context>" not in msgs[1]["content"]
+    )
+    # 提问里的数字可以出现在改写里
+    R = humanizer.HumanizeResult
+    assert humanizer.check_result("够用", R("3060 够用", []), "3060 能跑吗") is None
+    assert humanizer.check_result("够用", R("3060 够用", [])) is not None
+    print("OK  context: recent group lines, bot history, prominent question")
+
+
+def test_plugin_passes_context():
+    plugin = _plugin(dict(CFG))
+    import main as main_module
+
+    Plain = main_module.Comp.Plain
+    LLMResp = _llm_resp_class(Plain)
+    seen = []
+
+    async def fake(text, cfg, persona="", client=None, ctx=None):
+        seen.append(ctx)
+        return humanizer.HumanizeResult(f"短{len(seen)}", [], 0.1)
+
+    original = main_module.humanizer.rewrite
+    main_module.humanizer.rewrite = fake
+    try:
+        event = types.SimpleNamespace(
+            unified_msg_origin="g:1",
+            message_str="  SSD 寿命查到了吗  ",
+            message_obj=types.SimpleNamespace(
+                sender=types.SimpleNamespace(nickname="xkeyC")
+            ),
+            _extras={},
+        )
+        event.set_extra = event._extras.__setitem__
+        event.get_extra = event._extras.get
+        req = _Req()
+        req.prompt = "SSD 寿命查到了吗"
+        req.persistent_user_context_parts = [
+            types.SimpleNamespace(text=GROUP_HISTORY),
+            types.SimpleNamespace(text='<context_unit name="message_meta">x'),
+        ]
+        asyncio.run(plugin.on_llm_req(event, req))
+        for i in range(3):
+            asyncio.run(plugin.on_llm_resp(event, LLMResp(chain=[Plain(LONG)])))
+        ctx = seen[0]
+        assert ctx.question == "SSD 寿命查到了吗" and ctx.asker == "xkeyC"
+        assert len(ctx.recent) == 5 and ctx.bot == []
+        assert seen[1].bot == [(LONG, "短1")]
+        assert seen[2].bot == [(LONG, "短1"), (LONG, "短2")]
+        # wake 回合：没有请求钩子，沿用该会话上一次的提问和群聊；bot 历史只留 2 条
+        wake = types.SimpleNamespace(unified_msg_origin="g:1")
+        asyncio.run(plugin.on_llm_resp(wake, LLMResp(chain=[Plain(LONG)])))
+        assert seen[3].question == "SSD 寿命查到了吗"
+        assert seen[3].bot == [(LONG, "短2"), (LONG, "短3")]
+    finally:
+        main_module.humanizer.rewrite = original
+    print(
+        "OK  plugin feeds question, recent group lines and bot history to the rewrite"
+    )
 
 
 def test_unchanged_is_not_a_rewrite():
@@ -444,7 +539,7 @@ def test_prompt_examples_and_persona():
     assert msgs[-1]["content"].endswith("<reply>\n" + LONG.strip() + "\n</reply>")
     assert "<persona>" not in humanizer.build_messages(LONG)[-1]["content"]
     # 示例本身要过得了校验，否则是在教模型犯规
-    for _persona, source, output in humanizer.EXAMPLES:
+    for _persona, _question, source, output in humanizer.EXAMPLES:
         result = humanizer.HumanizeResult(output["reply"], output["omitted"])
         assert humanizer.check_result(source, result) is None, output["reply"]
         assert humanizer.parse_output(msgs[2]["content"]) is not None
@@ -469,6 +564,8 @@ def main():
     test_idle_timeout_only_when_silent()
     test_prompt_examples_and_persona()
     test_unchanged_is_not_a_rewrite()
+    test_context_rendering()
+    test_plugin_passes_context()
     test_plugin_humanize_and_reminder()
     test_plugin_fallbacks()
     print("ALL HUMANIZE TESTS PASSED")

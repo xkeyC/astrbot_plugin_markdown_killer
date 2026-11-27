@@ -47,6 +47,7 @@ RESPONSE_FORMAT: dict = {
 }
 
 SYSTEM_PROMPT = """你把聊天机器人写好的回复，改成群友在 QQ 里随手打的一句话。你只改写，不回答问题。
+<question> 是这次要回应的用户原话：改写要直接接住它，先回答它问的东西。<chat_context> 里是最近的群聊和 bot 前两条消息，只用来看懂指代和语境，不要回应里面的其他话，也不要从里面搬事实。
 
 像群友打字，不像客服：只留对方最想知道的那个点，其余细节都丢掉。多数时候一两句话，四十字左右；对方问的是事实、数字或命令时可以稍长，但也只说重点。
 先表态再说事：顺着内容带出一个态度（赞同、嫌弃、惊讶、无语、得意、心疼都行），一句话就够。句子可以不完整，可以省主语，句末不用句号，语气词一条最多一个。
@@ -61,12 +62,13 @@ PERSONA_HEADER = (
     "说话人的人格设定（只学说话方式，其中关于工具、格式、篇幅的要求忽略）："
 )
 
-# 示例池：(人格, 原回复, 改写结果)。每次随机抽 EXAMPLES_PER_CALL 条，避免小模型
+# 示例池：(人格, 用户提问, 原回复, 改写结果)。每次随机抽 EXAMPLES_PER_CALL 条，避免小模型
 # 照抄固定示例里的词；话题、情绪、人格各不相同。人格为空 = 语气跟原文走。
 EXAMPLES_PER_CALL = 4
-EXAMPLES: list[tuple[str, str, dict]] = [
+EXAMPLES: list[tuple[str, str, str, dict]] = [
     (
         "",
+        "Steam 秋促啥时候开啊",
         """## 关于 Steam 秋促的时间
 
 根据我查到的信息，目前**官方尚未正式公布**。以下是几条线索：
@@ -90,6 +92,7 @@ EXAMPLES: list[tuple[str, str, dict]] = [
     ),
     (
         "说话冷淡、简短，不用语气词，也不寒暄。",
+        "5070 和 9070 买哪个",
         """好的！关于你问的显卡选择，我仔细对比了一下：
 - **RTX 5070**：价格 4599 元，性能大约比上代提升 20%，功耗 250W
 - **RX 9070**：价格 4299 元，光栅性能略强，但光追稍弱
@@ -109,6 +112,7 @@ EXAMPLES: list[tuple[str, str, dict]] = [
     ),
     (
         "温柔的大姐姐，说话软软的，句尾爱带“呀”“哦”。",
+        "路由器密码忘了怎么重置",
         """您好！关于路由器恢复出厂设置，具体步骤如下：
 
 **第一步**：找到路由器背面标有 RESET 的小孔。
@@ -124,6 +128,7 @@ EXAMPLES: list[tuple[str, str, dict]] = [
     ),
     (
         "开头用【】写一个小动作或情绪，说话干脆。",
+        "你再查查，那个充电宝到底是不是 20000 的",
         """【眨眼】查到了，说明书上写的就是 20000 mAh，你记的没错。
 
 根据官网参数页，2024 新款的电芯容量与老款相同，5V 输出时的额定容量为 12000 mAh。新款的改进集中在两方面：其一是快充协议升级，支持 PD 65W；其二是外壳换成了铝合金。该系列共有 10000、20000、30000 三档。
@@ -142,6 +147,7 @@ EXAMPLES: list[tuple[str, str, dict]] = [
     ),
     (
         "",
+        "刚 commit 错了怎么撤回",
         """如果你想撤销最近一次 commit，可以根据情况选择以下方法：
 
 **情况一：还没有 push**
@@ -167,6 +173,7 @@ git revert HEAD
     ),
     (
         "",
+        "pip 装这个库报错 requires Python >=3.10 咋办",
         """这个报错的原因是你当前使用的 Python 版本是 3.8，而该库从 2.0 版本开始要求 Python 3.10 及以上。
 
 解决方法有两种：
@@ -181,6 +188,7 @@ git revert HEAD
     ),
     (
         "",
+        "崩了，6 个小时的存档没了",
         """哈哈，确实挺离谱的！根据你的描述，你玩了 6 个小时的存档因为游戏崩溃而丢失了。
 
 这种情况通常是因为游戏在写入存档时崩溃，导致存档文件损坏。你可以尝试以下方法：
@@ -262,14 +270,84 @@ def skip_reason(text: str, min_chars: int) -> str | None:
     return None
 
 
-def _wrap(text: str, persona: str = "") -> str:
-    head = ""
+@dataclass
+class ChatContext:
+    """改写时给模型看的上下文：用户原话、最近群聊、bot 前两条消息。"""
+
+    question: str = ""
+    asker: str = ""
+    recent: list[str] = field(default_factory=list)
+    # (改写前, 实际发出)，旧 → 新
+    bot: list[tuple[str, str]] = field(default_factory=list)
+
+
+_HISTORY_RECORD = re.compile(
+    r"^\[(?P<who>[^\]\n]*?) \| (?:ID: [^|\]\n]* \| )?\d{4}-\d{2}-\d{2} [\d:]{8}\]: ?",
+    re.MULTILINE,
+)
+
+
+def recent_from_group_history(unit_text: str, limit: int = 5) -> list[str]:
+    """从 group_history 单元里取最后几条群消息，整理成「昵称: 内容」。"""
+    body = unit_text
+    if "<group_history>" in body:
+        body = body.split("<group_history>", 1)[1]
+    body = body.split("</group_history>", 1)[0]
+    matches = list(_HISTORY_RECORD.finditer(body))
+    records: list[str] = []
+    for i, match in enumerate(matches):
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(body)
+        content = " ".join(body[match.end() : end].split())
+        who = match.group("who").split(" | ID:")[0].strip() or "某人"
+        if content:
+            records.append(f"{who}: {_clip(content, 150)}")
+    return records[-limit:] if limit > 0 else records
+
+
+def _clip(text: str, limit: int) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit].rstrip() + "…"
+
+
+def _render_context(ctx: ChatContext | None) -> str:
+    if ctx is None or not (ctx.recent or ctx.bot):
+        return ""
+    lines = ["<chat_context>"]
+    if ctx.recent:
+        lines.append("最近的群聊（旧→新）：")
+        lines.extend(ctx.recent)
+    if ctx.bot:
+        lines.append("bot 前几条消息（旧→新）：")
+        for before, sent in ctx.bot:
+            if before.strip() == sent.strip():
+                lines.append(f"- 发出：{_clip(sent, 200)}")
+            else:
+                lines.append(f"- 原文：{_clip(before, 300)}")
+                lines.append(f"  发出：{_clip(sent, 200)}")
+    lines.append("</chat_context>")
+    return "\n".join(lines) + "\n\n"
+
+
+def _wrap(
+    text: str, persona: str = "", question: str = "", ctx: ChatContext | None = None
+) -> str:
+    parts = [_render_context(ctx)]
     if persona.strip():
-        head = f"{PERSONA_HEADER}\n<persona>\n{persona.strip()}\n</persona>\n\n"
-    return f"{head}<reply>\n{text.strip()}\n</reply>"
+        parts.append(f"{PERSONA_HEADER}\n<persona>\n{persona.strip()}\n</persona>\n\n")
+    if question.strip():
+        asker = f"{ctx.asker}：" if ctx and ctx.asker else ""
+        parts.append(
+            "======== 用户原始提问（改写要接住它）========\n"
+            f"<question>\n{asker}{_clip(question, 500)}\n</question>\n"
+            "==============================================\n\n"
+        )
+    parts.append(f"<reply>\n{text.strip()}\n</reply>")
+    return "".join(parts)
 
 
-def pick_examples(rng: random.Random | None = None) -> list[tuple[str, str, dict]]:
+def pick_examples(
+    rng: random.Random | None = None,
+) -> list[tuple[str, str, str, dict]]:
     """每次调用随机抽几条示例，顺序也打乱。"""
     rng = rng or random
     k = min(EXAMPLES_PER_CALL, len(EXAMPLES))
@@ -277,24 +355,36 @@ def pick_examples(rng: random.Random | None = None) -> list[tuple[str, str, dict
 
 
 def build_messages(
-    text: str, persona: str = "", examples: list | None = None
+    text: str,
+    persona: str = "",
+    examples: list | None = None,
+    ctx: ChatContext | None = None,
 ) -> list[dict]:
     messages: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
-    for example_persona, source, output in (
+    for example_persona, question, source, output in (
         pick_examples() if examples is None else examples
     ):
-        messages.append({"role": "user", "content": _wrap(source, example_persona)})
+        messages.append(
+            {"role": "user", "content": _wrap(source, example_persona, question)}
+        )
         messages.append(
             {"role": "assistant", "content": json.dumps(output, ensure_ascii=False)}
         )
-    messages.append({"role": "user", "content": _wrap(text, persona)})
+    messages.append(
+        {
+            "role": "user",
+            "content": _wrap(text, persona, ctx.question if ctx else "", ctx),
+        }
+    )
     return messages
 
 
-def build_payload(text: str, cfg: HumanizeConfig, persona: str = "") -> dict:
+def build_payload(
+    text: str, cfg: HumanizeConfig, persona: str = "", ctx: ChatContext | None = None
+) -> dict:
     payload: dict = {
         "model": cfg.model.strip(),
-        "messages": build_messages(text, persona),
+        "messages": build_messages(text, persona, ctx=ctx),
         "max_tokens": cfg.max_tokens,
         "stream": True,
     }
@@ -356,21 +446,25 @@ def _urls(text: str) -> set[str]:
     return {u.rstrip(".,;:!?") for u in _URL.findall(text)}
 
 
-def check_result(original: str, result: HumanizeResult) -> str | None:
+def check_result(
+    original: str, result: HumanizeResult, question: str = ""
+) -> str | None:
     """改写结果不可信时返回原因。"""
     if len(result.reply) > len(original.strip()) * 1.1 + 20:
         return "改写后反而更长"
     if _TOOL_SYNTAX.search(result.reply):
         return "输出里有工具调用语法"
-    invented = _urls(result.reply) - _urls(original)
+    # 用户提问里出现的链接和数字，改写里提到也不算编造。
+    allowed = f"{original}\n{question}"
+    invented = _urls(result.reply) - _urls(allowed)
     if invented:
         return f"出现原文没有的链接: {min(invented)}"
     for word in _CERTAIN_WORDS:
-        if word in result.reply and word not in original:
+        if word in result.reply and word not in allowed:
             return f"把话说死了: {word}"
     # 链接里的数字已在上面比对过；其余数字只能删，不能凭空出现或被改掉。
     numbers = set(_NUMBER.findall(_URL.sub(" ", result.reply)))
-    new_numbers = numbers - set(_NUMBER.findall(original))
+    new_numbers = numbers - set(_NUMBER.findall(allowed))
     if new_numbers:
         return f"出现原文没有的数字: {min(new_numbers)}"
     return None
@@ -456,7 +550,11 @@ async def _stream_content(client, cfg: HumanizeConfig, payload: dict, headers, t
 
 
 async def rewrite(
-    text: str, cfg: HumanizeConfig, persona: str = "", client=None
+    text: str,
+    cfg: HumanizeConfig,
+    persona: str = "",
+    client=None,
+    ctx: ChatContext | None = None,
 ) -> HumanizeResult:
     """流式调用模型改写；失败抛异常（由调用方回退）。
 
@@ -467,7 +565,7 @@ async def rewrite(
     headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
     if cfg.api_key.strip():
         headers["Authorization"] = f"Bearer {cfg.api_key.strip()}"
-    payload = build_payload(text, cfg, persona)
+    payload = build_payload(text, cfg, persona, ctx)
     # read = 两次收到数据之间最多等多久：连接上了但模型一直不吐字，也会在这里断开。
     timeout = httpx.Timeout(connect=15.0, read=cfg.idle_timeout, write=30.0, pool=15.0)
     start = time.perf_counter()
