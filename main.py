@@ -59,7 +59,7 @@ _PERSONA_EXTRA = "_markdown_killer_persona"
     "astrbot_plugin_markdown_killer",
     "xkeyC",
     "移除输出中的Markdown格式（保留列表标记换行、支持表格与公式图片渲染）",
-    "0.5.2",
+    "0.5.3",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):
@@ -143,8 +143,10 @@ class MarkdownKillerPlugin(Star):
             model=str(self._config_get("humanize_model", "") or ""),
             extra_body=extra_body,
             temperature=temperature if temperature >= 0 else None,
-            timeout=float(
-                self._coerce_int(self._config_get("humanize_timeout", 20), default=20)
+            idle_timeout=float(
+                self._coerce_int(
+                    self._config_get("humanize_idle_timeout", 60), default=60
+                )
             ),
             min_chars=self._coerce_int(
                 self._config_get("humanize_min_chars", 80), default=80
@@ -451,7 +453,8 @@ class MarkdownKillerPlugin(Star):
                 )
                 reason = humanizer.check_result(original, result_obj)
             except Exception as e:  # noqa: BLE001 - 任何失败都回退
-                reason = f"改写失败: {e}"
+                # httpx 的超时异常 str() 是空串，带上类型才看得出是超时。
+                reason = f"改写失败: {type(e).__name__}: {e}".rstrip(": ")
 
         if reason is None and result_obj is not None:
             if humanizer.is_unchanged(original, result_obj):

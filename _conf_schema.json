@@ -97,11 +97,11 @@
         "default": 0.7,
         "hint": "填负数则不传温度，由服务端决定。"
     },
-    "humanize_timeout": {
-        "description": "拟人模式：超时（秒）",
+    "humanize_idle_timeout": {
+        "description": "拟人模式：多久不吐字就放弃（秒）",
         "type": "int",
-        "default": 20,
-        "hint": "超时就回退到普通清洗，原回复照常发出。"
+        "default": 60,
+        "hint": "改写走流式接口，只要模型还在输出（正文或思考）就一直等，没有总时长上限；连续这么久没有任何输出（排队、prefill 也算在内）才放弃，回退到普通清洗，原回复照常发出。"
     },
     "humanize_min_chars": {
         "description": "拟人模式：最短改写字数",

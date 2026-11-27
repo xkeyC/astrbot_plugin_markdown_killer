@@ -76,7 +76,7 @@ def test_skip_and_payload():
     payload = humanizer.build_payload(LONG, cfg)
     assert payload["prompt_cache_policy"] == "no_store"
     assert payload["chat_template_kwargs"] == {"enable_thinking": False}
-    assert payload["model"] == "m" and payload["stream"] is False
+    assert payload["model"] == "m" and payload["stream"] is True
     assert payload["response_format"]["type"] == "json_schema"
     no_schema = humanizer.HumanizeConfig(
         base_url="http://h", model="m", json_schema=False
@@ -86,14 +86,35 @@ def test_skip_and_payload():
     print("OK  skip rules, extra body parsing, payload carries no_store + thinking off")
 
 
-class _Resp:
-    def __init__(self, status, data):
-        self.status_code = status
-        self._data = data
-        self.text = json.dumps(data)
+def _sse(*objs):
+    return [f"data: {json.dumps(o, ensure_ascii=False)}" for o in objs] + [
+        "data: [DONE]"
+    ]
 
-    def json(self):
-        return self._data
+
+def _chunks(text, size=7, reasoning=""):
+    out = []
+    if reasoning:
+        out.append({"choices": [{"delta": {"reasoning_content": reasoning}}]})
+    for i in range(0, len(text), size):
+        out.append({"choices": [{"delta": {"content": text[i : i + size]}}]})
+    return out
+
+
+class _StreamResp:
+    def __init__(self, status, lines, delay=0.0):
+        self.status_code = status
+        self._lines = lines
+        self._delay = delay
+
+    async def aread(self):
+        return "\n".join(self._lines).encode()
+
+    async def aiter_lines(self):
+        for line in self._lines:
+            if self._delay:
+                await asyncio.sleep(self._delay)
+            yield line
 
 
 class _Client:
@@ -101,32 +122,60 @@ class _Client:
         self.resp = resp
         self.calls = []
 
-    async def post(self, url, json=None, headers=None, timeout=None):
-        self.calls.append((url, json, headers))
-        return self.resp
+    def stream(self, method, url, json=None, headers=None, timeout=None):
+        self.calls.append((method, url, json, headers, timeout))
+        resp = self.resp
+
+        class _Ctx:
+            async def __aenter__(self):
+                return resp
+
+            async def __aexit__(self, *exc):
+                return False
+
+        return _Ctx()
 
 
 def test_rewrite_http():
     cfg = humanizer.HumanizeConfig(base_url="http://h/v1", model="m", api_key="k")
     content = '{"reply": "可能是缓存", "omitted": ["查过的三个地方"]}'
-    client = _Client(_Resp(200, {"choices": [{"message": {"content": content}}]}))
+    client = _Client(_StreamResp(200, _sse(*_chunks(content, reasoning="想一下"))))
     out = asyncio.run(humanizer.rewrite(LONG, cfg, client=client))
     assert out.reply == "可能是缓存" and out.omitted == ["查过的三个地方"]
-    url, body, headers = client.calls[0]
-    assert url == "http://h/v1/chat/completions"
-    assert body["prompt_cache_policy"] == "no_store"
+    method, url, body, headers, timeout = client.calls[0]
+    assert method == "POST" and url == "http://h/v1/chat/completions"
+    assert body["stream"] is True and body["prompt_cache_policy"] == "no_store"
     assert headers["Authorization"] == "Bearer k"
+    assert timeout.read == 60.0  # 两次收到数据之间最多 60 秒
     for bad in (
-        _Resp(503, {"error": "busy"}),
-        _Resp(200, {"choices": []}),
-        _Resp(200, {"choices": [{"message": {"content": "随便"}}]}),
+        _StreamResp(503, ['{"error": "busy"}']),
+        _StreamResp(200, _sse({"error": {"message": "boom"}})),
+        _StreamResp(200, _sse(*_chunks("随便"))),
+        _StreamResp(200, ["data: [DONE]"]),
     ):
         try:
             asyncio.run(humanizer.rewrite(LONG, cfg, client=_Client(bad)))
             raise AssertionError("bad response accepted")
         except RuntimeError:
             pass
-    print("OK  rewrite posts to /chat/completions, raises on HTTP/format errors")
+    print("OK  rewrite streams /chat/completions, raises on HTTP/server/format errors")
+
+
+def test_idle_timeout_only_when_silent():
+    cfg = humanizer.HumanizeConfig(base_url="http://h", model="m", idle_timeout=0.05)
+    content = '{"reply": "慢慢吐也行", "omitted": []}'
+    # 每 30 ms 吐一块，总时长远超 50 ms：只要在吐字就不断开
+    slow = _StreamResp(200, _sse(*_chunks(content, size=3)), delay=0.03)
+    out = asyncio.run(humanizer.rewrite(LONG, cfg, client=_Client(slow)))
+    assert out.reply == "慢慢吐也行" and out.elapsed > 0.05
+    # 只有心跳、没有 token：超过 50 ms 就放弃
+    silent = _StreamResp(200, [": ping"] * 6 + _sse(*_chunks(content)), delay=0.03)
+    try:
+        asyncio.run(humanizer.rewrite(LONG, cfg, client=_Client(silent)))
+        raise AssertionError("silent stream accepted")
+    except humanizer.IdleTimeout as e:
+        assert "没有吐字" in str(e)
+    print("OK  idle timeout fires only while nothing is generated")
 
 
 def _plugin(config):
@@ -275,17 +324,27 @@ def test_plugin_fallbacks():
     LLMResp = _llm_resp_class(Plain)
     calls = []
 
+    class ReadTimeout(Exception):
+        """像 httpx.ReadTimeout 一样 str() 为空。"""
+
     async def failing(text, cfg, persona="", client=None):
         calls.append(text)
-        raise RuntimeError("timeout")
+        raise ReadTimeout()
 
     original = _patch_rewrite(main_module, failing)
     try:
         plugin = _plugin(dict(CFG))
         event = _Event(None)
         resp = LLMResp(chain=[Plain("**加粗**的一句话，" + "很长" * 20)])
-        asyncio.run(plugin.on_llm_resp(event, resp))
+        logged = []
+        real_info = main_module.logger.info
+        main_module.logger.info = lambda msg, *a, **k: logged.append(msg)
+        try:
+            asyncio.run(plugin.on_llm_resp(event, resp))
+        finally:
+            main_module.logger.info = real_info
         assert resp.completion_text.startswith("加粗的一句话")
+        assert any("改写失败: ReadTimeout）" in m for m in logged), logged
         req = _Req()
         asyncio.run(plugin.on_llm_req(event, req))
         assert req.units == []  # 失败不留提醒
@@ -398,6 +457,7 @@ def main():
     test_check_result()
     test_skip_and_payload()
     test_rewrite_http()
+    test_idle_timeout_only_when_silent()
     test_prompt_examples_and_persona()
     test_unchanged_is_not_a_rewrite()
     test_plugin_humanize_and_reminder()

@@ -147,7 +147,9 @@ class HumanizeConfig:
     model: str = ""
     extra_body: dict = field(default_factory=lambda: dict(DEFAULT_EXTRA_BODY))
     temperature: float | None = 0.7
-    timeout: float = 30.0
+    # 流式读取：只要还在吐 token（正文或思考）就一直等；连续这么久一个 token
+    # 都没有（排队、prefill 也算）才放弃。没有总时长上限。
+    idle_timeout: float = 60.0
     max_tokens: int = 4096
     json_schema: bool = True
     min_chars: int = 80
@@ -221,7 +223,7 @@ def build_payload(text: str, cfg: HumanizeConfig, persona: str = "") -> dict:
         "model": cfg.model.strip(),
         "messages": build_messages(text, persona),
         "max_tokens": cfg.max_tokens,
-        "stream": False,
+        "stream": True,
     }
     if cfg.temperature is not None:
         payload["temperature"] = cfg.temperature
@@ -323,34 +325,84 @@ def normalize_reply(text: str) -> str:
     return "\n".join(out).strip()
 
 
+class IdleTimeout(TimeoutError):
+    """模型连续 idle_timeout 秒没有吐出任何 token。"""
+
+
+def _delta_text(chunk: dict) -> tuple[str, bool]:
+    """一个 SSE 块里的正文增量，以及它是否带了任何 token（含思考）。"""
+    content: list[str] = []
+    produced = False
+    for choice in chunk.get("choices") or []:
+        delta = choice.get("delta") or choice.get("message") or {}
+        piece = delta.get("content")
+        if piece:
+            content.append(piece)
+            produced = True
+        if delta.get("reasoning_content") or delta.get("reasoning"):
+            produced = True
+    return "".join(content), produced
+
+
+async def _stream_content(client, cfg: HumanizeConfig, payload: dict, headers, timeout):
+    parts: list[str] = []
+    last_token = time.monotonic()
+    async with client.stream(
+        "POST", cfg.endpoint, json=payload, headers=headers, timeout=timeout
+    ) as resp:
+        if resp.status_code >= 400:
+            body = (await resp.aread()).decode("utf-8", "replace")
+            raise RuntimeError(f"HTTP {resp.status_code}: {body[:200]}")
+        async for line in resp.aiter_lines():
+            now = time.monotonic()
+            produced = False
+            line = line.strip()
+            if line.startswith("data:"):
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data)
+                except ValueError:
+                    chunk = None
+                if isinstance(chunk, dict):
+                    if chunk.get("error"):
+                        raise RuntimeError(f"服务端错误: {str(chunk['error'])[:200]}")
+                    piece, produced = _delta_text(chunk)
+                    if piece:
+                        parts.append(piece)
+            if produced:
+                last_token = now
+            elif now - last_token > cfg.idle_timeout:
+                # 只有心跳之类的空行在来，模型本身没有吐字。
+                raise IdleTimeout(f"{cfg.idle_timeout:.0f} 秒没有吐字")
+    return "".join(parts)
+
+
 async def rewrite(
     text: str, cfg: HumanizeConfig, persona: str = "", client=None
 ) -> HumanizeResult:
-    """调用模型改写；失败抛异常（由调用方回退）。
+    """流式调用模型改写；失败抛异常（由调用方回退）。
 
     ``client``: 可选的 ``httpx.AsyncClient``（测试注入）。
     """
     import httpx
 
-    headers = {"Content-Type": "application/json"}
+    headers = {"Content-Type": "application/json", "Accept": "text/event-stream"}
     if cfg.api_key.strip():
         headers["Authorization"] = f"Bearer {cfg.api_key.strip()}"
     payload = build_payload(text, cfg, persona)
+    # read = 两次收到数据之间最多等多久：连接上了但模型一直不吐字，也会在这里断开。
+    timeout = httpx.Timeout(connect=15.0, read=cfg.idle_timeout, write=30.0, pool=15.0)
     start = time.perf_counter()
-    if client is None:
-        async with httpx.AsyncClient(timeout=cfg.timeout, trust_env=False) as own:
-            resp = await own.post(cfg.endpoint, json=payload, headers=headers)
-    else:
-        resp = await client.post(
-            cfg.endpoint, json=payload, headers=headers, timeout=cfg.timeout
-        )
-    if resp.status_code >= 400:
-        raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
-    data = resp.json()
     try:
-        content = data["choices"][0]["message"]["content"] or ""
-    except (KeyError, IndexError, TypeError) as e:
-        raise RuntimeError(f"响应格式不对: {str(data)[:200]}") from e
+        if client is None:
+            async with httpx.AsyncClient(timeout=timeout, trust_env=False) as own:
+                content = await _stream_content(own, cfg, payload, headers, timeout)
+        else:
+            content = await _stream_content(client, cfg, payload, headers, timeout)
+    except httpx.ReadTimeout as e:
+        raise IdleTimeout(f"{cfg.idle_timeout:.0f} 秒没有吐字") from e
     result = parse_output(content)
     if result is None:
         raise RuntimeError(f"输出不是约定的 JSON: {content[:200]!r}")
