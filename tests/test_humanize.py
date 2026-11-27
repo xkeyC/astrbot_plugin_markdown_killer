@@ -52,13 +52,15 @@ def test_check_result():
     assert "更长" in humanizer.check_result(
         "短短的原文", R("这是一段比原文长很多很多很多很多很多很多很多很多的回复", [])
     )
-    assert "链接" in humanizer.check_result(LONG, R("看 https://evil.example/x", []))
-    assert "数字" in humanizer.check_result(LONG, R("报错码是 504", []))
+    # 不再核对事实：新链接、改动的数字、说死的话都放行，由后续轮次纠正
+    assert humanizer.check_result(LONG, R("看 https://evil.example/x", [])) is None
+    assert humanizer.check_result(LONG, R("报错码是 504", [])) is None
+    assert humanizer.check_result("约 813.4 亿美元", R("813 亿", [])) is None
     assert "工具" in humanizer.check_result(LONG, R("<tool_call>x", []))
-    assert "说死" in humanizer.check_result(LONG, R("肯定是缓存的问题", []))
+    assert humanizer.check_result(LONG, R("肯定是缓存的问题", [])) is None
     # 链接原样保留、只删数字都可以
     assert humanizer.check_result(LONG, R("文档在 https://example.com/doc", [])) is None
-    print("OK  check_result rejects longer/new URL/new number/tool syntax")
+    print("OK  check_result only rejects longer output and tool syntax")
 
 
 def test_skip_and_payload():
@@ -459,7 +461,6 @@ def test_context_rendering():
     # 提问里的数字可以出现在改写里
     R = humanizer.HumanizeResult
     assert humanizer.check_result("够用", R("3060 够用", []), "3060 能跑吗") is None
-    assert humanizer.check_result("够用", R("3060 够用", [])) is not None
     print("OK  context: recent group lines, bot history, prominent question")
 
 

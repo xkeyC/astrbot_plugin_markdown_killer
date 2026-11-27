@@ -204,11 +204,7 @@ git revert HEAD
 ]
 
 
-_URL = re.compile(r"https?://[^\s<>()\[\]{}\"'，。！？、；：）】」』]+")
 _JSON_FENCE = re.compile(r"^```(?:json)?\s*|\s*```$", re.DOTALL)
-_NUMBER = re.compile(r"\d+(?:[.,]\d+)*")
-# 情绪一上头容易把"可能"改成"肯定"：原文没有这些词，改写里就不许出现。
-_CERTAIN_WORDS = ("肯定", "一定", "绝对", "百分百", "必然", "铁定")
 _TOOL_SYNTAX = re.compile(r"<tool_call>|<function[=>]|<parameter[=>]|\[TOOL_CALLS\]")
 
 
@@ -442,31 +438,19 @@ def _salvage(text: str) -> dict | None:
     return {"reply": reply, "omitted": [i.replace('\\"', '"') for i in items]}
 
 
-def _urls(text: str) -> set[str]:
-    return {u.rstrip(".,;:!?") for u in _URL.findall(text)}
-
-
 def check_result(
     original: str, result: HumanizeResult, question: str = ""
 ) -> str | None:
-    """改写结果不可信时返回原因。"""
+    """改写结果明显不能用时返回原因（只看形式，不核对事实）。
+
+    以前还比对数字、链接和"肯定/一定"，太严：813.4 亿写成 813 亿也被拦下，
+    整条长回复原样发出。改写里的事实偏差由 agent 在后续轮次从"回复已简化"
+    提醒里看到实际发出的内容后自行纠正。``question`` 保留以兼容调用方。
+    """
     if len(result.reply) > len(original.strip()) * 1.1 + 20:
         return "改写后反而更长"
     if _TOOL_SYNTAX.search(result.reply):
         return "输出里有工具调用语法"
-    # 用户提问里出现的链接和数字，改写里提到也不算编造。
-    allowed = f"{original}\n{question}"
-    invented = _urls(result.reply) - _urls(allowed)
-    if invented:
-        return f"出现原文没有的链接: {min(invented)}"
-    for word in _CERTAIN_WORDS:
-        if word in result.reply and word not in allowed:
-            return f"把话说死了: {word}"
-    # 链接里的数字已在上面比对过；其余数字只能删，不能凭空出现或被改掉。
-    numbers = set(_NUMBER.findall(_URL.sub(" ", result.reply)))
-    new_numbers = numbers - set(_NUMBER.findall(allowed))
-    if new_numbers:
-        return f"出现原文没有的数字: {min(new_numbers)}"
     return None
 
 

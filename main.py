@@ -63,7 +63,7 @@ _RECENT_BOT_MESSAGES = 2
     "astrbot_plugin_markdown_killer",
     "xkeyC",
     "移除输出中的Markdown格式（保留列表标记换行、支持表格与公式图片渲染）",
-    "0.6.2",
+    "0.6.3",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):
