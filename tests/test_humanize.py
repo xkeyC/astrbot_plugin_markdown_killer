@@ -168,11 +168,48 @@ CFG = {
 }
 
 
+def _llm_resp_class(Plain):
+    """模仿 LLMResponse：completion_text 由 result_chain 派生，setter 替换 Plain。"""
+
+    class _LLMResp:
+        def __init__(self, chain=None, text=None, role="assistant"):
+            self.role = role
+            self.result_chain = (
+                types.SimpleNamespace(chain=list(chain)) if chain is not None else None
+            )
+            self._text = text
+
+        @property
+        def completion_text(self):
+            if self.result_chain:
+                return "".join(
+                    c.text for c in self.result_chain.chain if isinstance(c, Plain)
+                )
+            return self._text
+
+        @completion_text.setter
+        def completion_text(self, value):
+            if self.result_chain:
+                kept = [c for c in self.result_chain.chain if not isinstance(c, Plain)]
+                self.result_chain.chain = [Plain(value), *kept]
+            else:
+                self._text = value
+
+    return _LLMResp
+
+
+def _patch_rewrite(main_module, fn):
+    original = main_module.humanizer.rewrite
+    main_module.humanizer.rewrite = fn
+    return original
+
+
 def test_plugin_humanize_and_reminder():
     plugin = _plugin(dict(CFG))
     import main as main_module
 
     Plain = main_module.Comp.Plain
+    LLMResp = _llm_resp_class(Plain)
     calls = []
     personas = []
 
@@ -183,14 +220,8 @@ def test_plugin_humanize_and_reminder():
             "可能是缓存的问题。\n\n\n排队满了会报 503。", ["查过的三个地方"], 0.1
         )
 
-    original = main_module.humanizer.rewrite
-    main_module.humanizer.rewrite = fake_rewrite
+    original = _patch_rewrite(main_module, fake_rewrite)
     try:
-        # on_llm_response 不再做规则清洗
-        resp = types.SimpleNamespace(completion_text=LONG)
-        asyncio.run(plugin.on_llm_resp(None, resp))
-        assert resp.completion_text == LONG
-
         # 上一次请求带着人格：插件按会话记下，改写时交给模型
         persona_req = _Req()
         persona_req.context_anchors = {
@@ -199,14 +230,21 @@ def test_plugin_humanize_and_reminder():
         asyncio.run(plugin.on_llm_req(_Event(None), persona_req))
         assert persona_req.units == []
 
+        # 正常回合：Codex 的 result_chain 被原地改写（发出的就是这个对象）
         part1, part2 = Plain(LONG[:30]), Plain(LONG[30:])
-        result = _Result([part1, part2])
-        event = _Event(result)
-        asyncio.run(plugin.on_decorating_result(event))
+        resp = LLMResp(chain=[part1, part2])
+        chain_obj = resp.result_chain
+        event = _Event(None)
+        asyncio.run(plugin.on_llm_resp(event, resp))
         assert calls == [LONG]
         assert personas == ["你是猫娘，自称本喵，句尾带喵。"]
-        assert len(result.chain) == 1
-        assert result.chain[0].text == "可能是缓存的问题。\n\n排队满了会报 503。"
+        assert resp.result_chain is chain_obj and len(chain_obj.chain) == 1
+        assert chain_obj.chain[0].text == "可能是缓存的问题。\n\n排队满了会报 503。"
+
+        # 装饰阶段不再改写第二次
+        result = _Result(list(chain_obj.chain))
+        asyncio.run(plugin.on_decorating_result(_Event(result)))
+        assert calls == [LONG]
 
         req = _Req()
         asyncio.run(plugin.on_llm_req(event, req))
@@ -217,10 +255,15 @@ def test_plugin_humanize_and_reminder():
         req2 = _Req()
         asyncio.run(plugin.on_llm_req(event, req2))
         assert req2.units == []
+
+        # 只有 completion_text 的回复（工具循环 runner）也改写
+        bare = LLMResp(text=LONG)
+        asyncio.run(plugin.on_llm_resp(event, bare))
+        assert bare.completion_text == "可能是缓存的问题。\n\n排队满了会报 503。"
     finally:
         main_module.humanizer.rewrite = original
     print(
-        "OK  humanize rewrites the chain once and the reminder rides the next request"
+        "OK  humanize rewrites in on_llm_response; the reminder rides the next request"
     )
 
 
@@ -229,32 +272,61 @@ def test_plugin_fallbacks():
     import main as main_module
 
     Plain = main_module.Comp.Plain
+    LLMResp = _llm_resp_class(Plain)
+    calls = []
 
     async def failing(text, cfg, persona="", client=None):
+        calls.append(text)
         raise RuntimeError("timeout")
 
-    original = main_module.humanizer.rewrite
-    main_module.humanizer.rewrite = failing
+    original = _patch_rewrite(main_module, failing)
     try:
         plugin = _plugin(dict(CFG))
-        result = _Result([Plain("**加粗**的一句话，" + "很长" * 20)])
-        event = _Event(result)
-        asyncio.run(plugin.on_decorating_result(event))
-        assert result.chain[0].text.startswith("加粗的一句话")
+        event = _Event(None)
+        resp = LLMResp(chain=[Plain("**加粗**的一句话，" + "很长" * 20)])
+        asyncio.run(plugin.on_llm_resp(event, resp))
+        assert resp.completion_text.startswith("加粗的一句话")
         req = _Req()
         asyncio.run(plugin.on_llm_req(event, req))
         assert req.units == []  # 失败不留提醒
 
-        # 流式结果原样不动
-        streamed = _Result([Plain("**原样**" + "x" * 50)], typ="STREAMING_FINISH")
-        asyncio.run(plugin.on_decorating_result(_Event(streamed)))
-        assert streamed.chain[0].text.startswith("**原样**")
+        # 错误回复、流式会话：不改写，照常清洗
+        calls.clear()
+        err = LLMResp(chain=[Plain("**出错**了" + "x" * 90)], role="err")
+        asyncio.run(plugin.on_llm_resp(event, err))
+        assert calls == [] and err.completion_text.startswith("出错了")
+
+        streaming = _plugin(dict(CFG))
+        streaming.context = types.SimpleNamespace(
+            get_config=lambda umo=None: {
+                "provider_settings": {"streaming_response": True}
+            }
+        )
+        streamed = LLMResp(chain=[Plain("**原样**" + "x" * 90)])
+        asyncio.run(streaming.on_llm_resp(event, streamed))
+        assert calls == [] and streamed.completion_text.startswith("原样")
+
+        # 平台不支持流式且策略为 turn_off：实际按非流式发，照常改写
+        streaming.context = types.SimpleNamespace(
+            get_config=lambda umo=None: {
+                "provider_settings": {
+                    "streaming_response": True,
+                    "unsupported_streaming_strategy": "turn_off",
+                }
+            }
+        )
+        qq = types.SimpleNamespace(
+            unified_msg_origin="qq:1",
+            platform_meta=types.SimpleNamespace(support_streaming_message=False),
+        )
+        asyncio.run(streaming.on_llm_resp(qq, LLMResp(chain=[Plain("y" * 90)])))
+        assert len(calls) == 1
 
         # 没填模型时等同关闭：on_llm_response 照常清洗
         off = _plugin({**CFG, "humanize_model": ""})
-        resp = types.SimpleNamespace(completion_text="**粗体**")
-        asyncio.run(off.on_llm_resp(None, resp))
-        assert resp.completion_text == "粗体"
+        bare = types.SimpleNamespace(completion_text="**粗体**")
+        asyncio.run(off.on_llm_resp(None, bare))
+        assert bare.completion_text == "粗体"
 
         # 模型原样返回：按普通清洗发出，不留提醒
         async def same(text, cfg, persona="", client=None):
@@ -263,10 +335,10 @@ def test_plugin_fallbacks():
         main_module.humanizer.rewrite = same
         plugin = _plugin(dict(CFG))
         a, b = Plain("**一段**本来就该原样发的文案，"), Plain("内容" * 40)
-        result = _Result([a, b])
-        event = _Event(result)
-        asyncio.run(plugin.on_decorating_result(event))
-        assert result.chain == [a, b] and a.text == "一段本来就该原样发的文案，"
+        resp = LLMResp(chain=[a, b])
+        asyncio.run(plugin.on_llm_resp(event, resp))
+        assert resp.result_chain.chain == [a, b]
+        assert a.text == "一段本来就该原样发的文案，"
         req = _Req()
         asyncio.run(plugin.on_llm_req(event, req))
         assert req.units == []
@@ -277,14 +349,13 @@ def test_plugin_fallbacks():
 
         main_module.humanizer.rewrite = ok
         quiet = _plugin({**CFG, "humanize_notify_agent": False})
-        event = _Event(_Result([Plain("y" * 60)]))
-        asyncio.run(quiet.on_decorating_result(event))
+        asyncio.run(quiet.on_llm_resp(event, LLMResp(chain=[Plain("y" * 60)])))
         req = _Req()
         asyncio.run(quiet.on_llm_req(event, req))
         assert req.units == []
     finally:
         main_module.humanizer.rewrite = original
-    print("OK  failure/streaming/unconfigured/notify-off fall back without reminders")
+    print("OK  failure/err/streaming/unconfigured/unchanged/notify-off fall back")
 
 
 def test_unchanged_is_not_a_rewrite():

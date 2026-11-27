@@ -46,6 +46,7 @@ import asyncio
 import json
 import re
 import time
+import types
 
 _PLAYWRIGHT_RETRY_COOLDOWN_SEC = 600
 # 每个会话最多攒几条"回复已简化"提醒，等下一次正常请求时一起带上。
@@ -58,7 +59,7 @@ _PERSONA_EXTRA = "_markdown_killer_persona"
     "astrbot_plugin_markdown_killer",
     "xkeyC",
     "移除输出中的Markdown格式（保留列表标记换行、支持表格与公式图片渲染）",
-    "0.5.1",
+    "0.5.2",
     "https://github.com/xkeyC/astrbot_plugin_markdown_killer",
 )
 class MarkdownKillerPlugin(Star):
@@ -314,8 +315,15 @@ class MarkdownKillerPlugin(Star):
             resp.completion_text = stripped_text
             self._log_cleaned_text(original_text, stripped_text, source="[引用标记]")
             original_text = stripped_text
-        if self._humanize_active:
-            # 拟人模式在 on_decorating_result 里改写整条消息；改写不了时再清洗。
+        if (
+            self._humanize_active
+            and getattr(resp, "role", "assistant") == "assistant"
+            and not self._reply_is_streamed(event)
+        ):
+            # 拟人模式在这里改写，而不是 on_decorating_result：异步任务、后台命令、
+            # 迟到图片等 wake 回合由 codex wake 直接 send_message 发出，不经过
+            # 装饰阶段，只有这个钩子两条路都会经过。改写不了时内部回退到清洗。
+            await self._humanize_resp(event, resp)
             return
 
         cleaned_text = self._clean_llm_text(original_text)
@@ -379,8 +387,49 @@ class MarkdownKillerPlugin(Star):
         pending.append(text)
         del pending[:-_MAX_PENDING_REMINDERS]
 
+    def _reply_is_streamed(self, event) -> bool:
+        """该会话的回复是否以流式发出（已发出的流式文本无法再改写）。"""
+        ctx = getattr(self, "context", None)
+        get_config = getattr(ctx, "get_config", None)
+        if not callable(get_config):
+            return False
+        try:
+            cfg = get_config(umo=getattr(event, "unified_msg_origin", None)) or {}
+        except Exception:  # noqa: BLE001 - 读不到配置就按非流式处理
+            return False
+        settings = cfg.get("provider_settings", {}) or {}
+        if not settings.get("streaming_response"):
+            return False
+        meta = getattr(event, "platform_meta", None)
+        if (
+            meta is not None
+            and not getattr(meta, "support_streaming_message", True)
+            and settings.get("unsupported_streaming_strategy") == "turn_off"
+        ):
+            return False
+        if not self._humanize_streaming_warned:
+            self._humanize_streaming_warned = True
+            logger.warning(
+                "[MarkdownKiller] 流式输出已经原样发出，拟人模式无法改写；"
+                "需要拟人模式请关闭流式输出。"
+            )
+        return True
+
+    async def _humanize_resp(self, event: AstrMessageEvent, resp) -> None:
+        """在 LLMResponse 上做拟人改写：有 result_chain 就原地改它（Codex 发出的
+        就是这个对象），否则改 completion_text。"""
+        chain_obj = getattr(resp, "result_chain", None)
+        if chain_obj is not None and getattr(chain_obj, "chain", None):
+            await self._humanize_result(event, chain_obj)
+            return
+        holder = types.SimpleNamespace(chain=[Comp.Plain(resp.completion_text)])
+        await self._humanize_result(event, holder)
+        resp.completion_text = "".join(
+            c.text for c in holder.chain if isinstance(c, Comp.Plain)
+        )
+
     async def _humanize_result(self, event: AstrMessageEvent, result) -> None:
-        """拟人模式：改写一条 LLM 结果；跳过或失败时回退到规则清洗。"""
+        """拟人模式：改写一条消息链（有 .chain 的对象）；跳过或失败时回退到规则清洗。"""
         plains = [c for c in result.chain if isinstance(c, Comp.Plain)]
         others = [
             c
@@ -449,18 +498,7 @@ class MarkdownKillerPlugin(Star):
 
         # Streaming results were already shown to the user as raw text; skip.
         if result.result_content_type == ResultContentType.STREAMING_FINISH:
-            if self._humanize_active and not self._humanize_streaming_warned:
-                self._humanize_streaming_warned = True
-                logger.warning(
-                    "[MarkdownKiller] 流式输出已经原样发出，拟人模式无法改写；"
-                    "需要拟人模式请关闭流式输出。"
-                )
             return
-
-        if self._humanize_active and result.result_content_type == getattr(
-            ResultContentType, "LLM_RESULT", None
-        ):
-            await self._humanize_result(event, result)
 
         # Phase 1: extract tables/formulas and render them to images.
         rendered_image_ids: set[int] = set()
